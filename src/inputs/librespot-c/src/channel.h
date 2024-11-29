@@ -30,3 +30,6 @@ channel_retry(struct sp_channel *channel);
 
 int
 channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_session *session);
+
+int
+channel_http_body_read(struct sp_channel *channel, uint8_t *body, size_t body_len);

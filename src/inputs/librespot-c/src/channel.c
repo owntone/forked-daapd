@@ -63,6 +63,8 @@ channel_get(uint32_t channel_id, struct sp_session *session)
 void
 channel_free(struct sp_channel *channel)
 {
+  int i;
+
   if (!channel || channel->state == SP_CHANNEL_STATE_UNALLOCATED)
     return;
 
@@ -81,6 +83,9 @@ channel_free(struct sp_channel *channel)
   crypto_aes_free(&channel->file.decrypt);
 
   free(channel->file.path);
+
+  for (i = 0; i < ARRAY_SIZE(channel->file.cdnurl); i++)
+    free(channel->file.cdnurl[i]);
 
   memset(channel, 0, sizeof(struct sp_channel));
 
@@ -208,7 +213,8 @@ channel_seek_internal(struct sp_channel *channel, size_t pos, bool do_flush)
   channel->seek_pos = pos;
 
   // If seek + header isn't word aligned we will get up to 3 bytes before the
-  // actual seek position. We will remove those when they are received.
+  // actual seek position with the legacy protocol. We will remove those when
+  // they are received.
   channel->seek_align = (pos + SP_OGG_HEADER_LEN) % 4;
 
   seek_words = (pos + SP_OGG_HEADER_LEN) / 4;
@@ -218,8 +224,8 @@ channel_seek_internal(struct sp_channel *channel, size_t pos, bool do_flush)
     RETURN_ERROR(SP_ERR_DECRYPTION, sp_errmsg);
 
   // Set the offset and received counter to match the seek
-  channel->file.offset_words = seek_words;
-  channel->file.received_words = seek_words;
+  channel->file.offset_bytes = 4 * seek_words;
+  channel->file.received_bytes = 4 * seek_words;
 
   return 0;
 
@@ -241,14 +247,14 @@ channel_pause(struct sp_channel *channel)
   channel->state = SP_CHANNEL_STATE_PAUSED;
 }
 
-// After a disconnect we connect to another one and try to resume. To make that
-// work some data elements need to be reset.
+// After a disconnect we connect to another AP and try to resume. To make that
+// work during playback some data elements need to be reset.
 void
 channel_retry(struct sp_channel *channel)
 {
   size_t pos;
 
-  if (!channel)
+  if (!channel || channel->state != SP_CHANNEL_STATE_PLAYING)
     return;
 
   channel->is_data_mode = false;
@@ -256,7 +262,7 @@ channel_retry(struct sp_channel *channel)
   memset(&channel->header, 0, sizeof(struct sp_channel_header));
   memset(&channel->body, 0, sizeof(struct sp_channel_body));
 
-  pos = 4 * channel->file.received_words - SP_OGG_HEADER_LEN;
+  pos = channel->file.received_bytes - SP_OGG_HEADER_LEN;
 
   channel_seek_internal(channel, pos, false); // false => don't flush
 }
@@ -316,12 +322,12 @@ channel_header_handle(struct sp_channel *channel, struct sp_channel_header *head
 	}
 
       memcpy(&be32, header->data, sizeof(be32));
-      channel->file.len_words = be32toh(be32);
+      channel->file.len_bytes = 4 * be32toh(be32);
     }
 }
 
 static ssize_t
-channel_header_trailer_read(struct sp_channel *channel, uint8_t *msg, size_t msg_len, struct sp_session *session)
+channel_header_trailer_read(struct sp_channel *channel, uint8_t *msg, size_t msg_len)
 {
   ssize_t parsed_len;
   ssize_t consumed_len;
@@ -333,10 +339,10 @@ channel_header_trailer_read(struct sp_channel *channel, uint8_t *msg, size_t msg
   if (msg_len == 0)
     {
       channel->file.end_of_chunk = true;
-      channel->file.end_of_file = (channel->file.received_words >= channel->file.len_words);
+      channel->file.end_of_file = (channel->file.received_bytes >= channel->file.len_bytes);
 
       // In preparation for next chunk
-      channel->file.offset_words += SP_CHUNK_LEN_WORDS;
+      channel->file.offset_bytes += SP_CHUNK_LEN;
       channel->is_data_mode = false;
 
       return 0;
@@ -369,22 +375,19 @@ channel_header_trailer_read(struct sp_channel *channel, uint8_t *msg, size_t msg
   return ret;
 }
 
-static ssize_t
-channel_data_read(struct sp_channel *channel, uint8_t *msg, size_t msg_len, struct sp_session *session)
+static int
+channel_data_read(struct sp_channel *channel, uint8_t *msg, size_t msg_len)
 {
   const char *errmsg;
   int ret;
 
-  assert (msg_len % 4 == 0);
-
-  channel->file.received_words += msg_len / 4;
+  channel->file.received_bytes += msg_len;
 
   ret = crypto_aes_decrypt(msg, msg_len, &channel->file.decrypt, &errmsg);
   if (ret < 0)
     RETURN_ERROR(SP_ERR_DECRYPTION, errmsg);
 
   // Skip Spotify header
-  // TODO What to do here when seeking
   if (!channel->is_spotify_header_received)
     {
       if (msg_len < SP_OGG_HEADER_LEN)
@@ -464,7 +467,7 @@ channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_s
   msg_len -= sizeof(be);
 
   // Will set data_mode, end_of_file and end_of_chunk as appropriate
-  consumed_len = channel_header_trailer_read(channel, msg, msg_len, session);
+  consumed_len = channel_header_trailer_read(channel, msg, msg_len);
   if (consumed_len < 0)
     RETURN_ERROR((int)consumed_len, sp_errmsg);
 
@@ -477,9 +480,9 @@ channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_s
   if (!channel->is_data_mode || !(msg_len > 0))
     return 0; // Not in data mode or no data to read
 
-  consumed_len = channel_data_read(channel, msg, msg_len, session);
-  if (consumed_len < 0)
-    RETURN_ERROR((int)consumed_len, sp_errmsg);
+  ret = channel_data_read(channel, msg, msg_len);
+  if (ret < 0)
+    RETURN_ERROR(ret, sp_errmsg);
 
   return 0;
 
@@ -487,3 +490,21 @@ channel_msg_read(uint16_t *channel_id, uint8_t *msg, size_t msg_len, struct sp_s
   return ret;
 }
 
+// With http there is the Spotify Ogg header, but no chunk header/trailer
+int
+channel_http_body_read(struct sp_channel *channel, uint8_t *body, size_t body_len)
+{
+  int ret;
+
+  ret = channel_data_read(channel, body, body_len);
+  if (ret < 0)
+    goto error;
+
+  channel->file.end_of_chunk = true;
+  channel->file.end_of_file = (channel->file.received_bytes >= channel->file.len_bytes);
+  channel->file.offset_bytes += SP_CHUNK_LEN;
+  return 0;
+
+ error:
+  return ret;
+}

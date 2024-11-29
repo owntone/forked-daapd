@@ -1,9 +1,14 @@
 AC_INIT([librespot-c], [0.1])
 AC_CONFIG_AUX_DIR([.])
 AM_INIT_AUTOMAKE([foreign subdir-objects])
+AM_SILENT_RULES([yes])
+
 AC_PROG_CC
 AM_PROG_AR
 AC_PROG_RANLIB
+
+AM_CPPFLAGS="-Wall"
+AC_SUBST([AM_CPPFLAGS])
 
 AC_CHECK_HEADERS_ONCE([sys/utsname.h])
 

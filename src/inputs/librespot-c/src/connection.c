@@ -1,3 +1,5 @@
+#define _GNU_SOURCE // For asprintf and vasprintf
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -15,6 +17,12 @@
 #include "librespot-c-internal.h"
 #include "connection.h"
 #include "channel.h"
+#include "http.h"
+
+#define MERCURY_REQ_SIZE_MAX 4096
+
+// Forgot how I arrived at this upper bound
+#define HASHCASH_ITERATIONS_MAX 100000
 
 static struct timeval sp_idle_tv = { SP_AP_DISCONNECT_SECS, 0 };
 
@@ -32,6 +40,23 @@ static struct sp_err_map sp_login_errors[] = {
   { ERROR_CODE__ExtraVerificationRequired, "Extra verification required" },
   { ERROR_CODE__InvalidAppKey, "Invalid app key" },
   { ERROR_CODE__ApplicationBanned, "Application banned" },
+};
+
+static struct sp_err_map sp_login5_warning_map[] = {
+  { SPOTIFY__LOGIN5__V3__LOGIN_RESPONSE__WARNINGS__UNKNOWN_WARNING, "Unknown warning" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_RESPONSE__WARNINGS__DEPRECATED_PROTOCOL_VERSION, "Deprecated protocol" },
+};
+
+static struct sp_err_map sp_login5_error_map[] = {
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__UNKNOWN_ERROR, "Unknown error" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__INVALID_CREDENTIALS, "Invalid credentials" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__BAD_REQUEST, "Bad request" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__UNSUPPORTED_LOGIN_PROTOCOL, "Unsupported login protocol" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__TIMEOUT, "Timeout" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__UNKNOWN_IDENTIFIER, "Unknown identifier" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__TOO_MANY_ATTEMPTS, "Too many attempts" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__INVALID_PHONENUMBER, "Invalid phonenumber" },
+  { SPOTIFY__LOGIN5__V3__LOGIN_ERROR__TRY_AGAIN_LATER, "Try again later" },
 };
 
 /* ---------------------------------- MOCKING ------------------------------- */
@@ -86,6 +111,23 @@ debug_mock_response(struct sp_message *msg, struct sp_connection *conn)
 
 
 /* --------------------------------- Helpers -------------------------------- */
+
+static char *
+asprintf_or_die(const char *fmt, ...)
+{
+  char *ret = NULL;
+  va_list va;
+
+  va_start(va, fmt);
+  if (vasprintf(&ret, fmt, va) < 0)
+    {
+      sp_cb.logmsg("Out of memory for asprintf\n");
+      abort();
+    }
+  va_end(va);
+
+  return ret;
+}
 
 #ifdef HAVE_SYS_UTSNAME_H
 static void
@@ -185,76 +227,22 @@ file_select(uint8_t *out, size_t out_len, Track *track, enum sp_bitrates bitrate
   return 0;
 }
 
+static const char *
+err2txt(int err, struct sp_err_map *map, size_t map_size)
+{
+  for (int i = 0; i < map_size; i++)
+    {
+      if (err == map[i].errorcode)
+        return map[i].errmsg;
+    }
+
+  return "(unknown error code)";
+}
 
 /* --------------------------- Connection handling -------------------------- */
 
-// Connects to access point resolver and selects the first access point (unless
-// it matches "avoid", i.e. an access point that previously failed)
-static int
-ap_resolve(char **address, unsigned short *port, const char *avoid)
-{
-  char *body = NULL;
-  json_object *jresponse = NULL;
-  json_object *ap_list;
-  json_object *ap;
-  char *ap_address = NULL;
-  char *ap_port;
-  int ap_num;
-  int ret;
-  int i;
-
-  free(*address);
-  *address = NULL;
-
-  ret = sp_cb.https_get(&body, SP_AP_RESOLVE_URL);
-  if (ret < 0)
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Could not connect to access point resolver");
-
-  jresponse = json_tokener_parse(body);
-  if (!jresponse)
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Could not parse reply from access point resolver");
-
-  if (! (json_object_object_get_ex(jresponse, SP_AP_RESOLVE_KEY, &ap_list) || json_object_get_type(ap_list) == json_type_array))
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Unexpected reply from access point resolver");
-
-  ap_num = json_object_array_length(ap_list);
-
-  for (i = 0; i < ap_num; i++)
-    {
-      ap = json_object_array_get_idx(ap_list, i);
-      if (! (ap && json_object_get_type(ap) == json_type_string))
-        RETURN_ERROR(SP_ERR_NOCONNECTION, "Unexpected reply from access point resolver");
-
-      if (avoid && strncmp(avoid, json_object_get_string(ap), strlen(avoid)) == 0)
-        continue; // This AP has failed on us previously, so avoid
-
-      ap_address = strdup(json_object_get_string(ap));
-      break;
-    }
-
-  if (!ap_address)
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Unexpected reply from access point resolver, no suitable access point");
-  if (! (ap_port = strchr(ap_address, ':')))
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Unexpected reply from access point resolver, missing port");
-  *ap_port = '\0';
-  ap_port += 1;
-
-  *address = ap_address;
-  *port = (unsigned short)atoi(ap_port);
-
-  json_object_put(jresponse);
-  free(body);
-  return 0;
-
- error:
-  free(ap_address);
-  json_object_put(jresponse);
-  free(body);
-  return ret;
-}
-
 static void
-connection_clear(struct sp_connection *conn)
+tcp_connection_clear(struct sp_connection *conn)
 {
   if (!conn)
     return;
@@ -271,24 +259,14 @@ connection_clear(struct sp_connection *conn)
   if (conn->incoming)
     evbuffer_free(conn->incoming);
 
-  free(conn->ap_address);
   free(conn->keys.shared_secret);
 
   memset(conn, 0, sizeof(struct sp_connection));
   conn->response_fd = -1;
 }
 
-void
-ap_disconnect(struct sp_connection *conn)
-{
-  if (conn->is_connected)
-    sp_cb.tcp_disconnect(conn->response_fd);
-
-  connection_clear(conn);
-}
-
 static void
-connection_idle_cb(int fd, short what, void *arg)
+tcp_connection_idle_cb(int fd, short what, void *arg)
 {
   struct sp_connection *conn = arg;
 
@@ -298,20 +276,13 @@ connection_idle_cb(int fd, short what, void *arg)
 }
 
 static int
-connection_make(struct sp_connection *conn, const char *ap_avoid, struct sp_conn_callbacks *cb, void *response_cb_arg)
+tcp_connection_make(struct sp_connection *conn, struct sp_server *server, struct sp_conn_callbacks *cb, void *cb_arg)
 {
   int response_fd;
   int ret;
 
-  if (!conn->ap_address || !conn->ap_port)
-    {
-      ret = ap_resolve(&conn->ap_address, &conn->ap_port, ap_avoid);
-      if (ret < 0)
-	RETURN_ERROR(ret, sp_errmsg);
-    }
-
 #ifndef DEBUG_MOCK
-  response_fd = sp_cb.tcp_connect(conn->ap_address, conn->ap_port);
+  response_fd = sp_cb.tcp_connect(server->address, server->port);
   if (response_fd < 0)
     RETURN_ERROR(SP_ERR_NOCONNECTION, "Could not connect to access point");
 #else
@@ -319,11 +290,14 @@ connection_make(struct sp_connection *conn, const char *ap_avoid, struct sp_conn
   response_fd = debug_mock_pipe[0];
 #endif
 
-  conn->response_fd = response_fd;
-  conn->response_ev = event_new(cb->evbase, response_fd, EV_READ | EV_PERSIST, cb->response_cb, response_cb_arg);
-  conn->timeout_ev = evtimer_new(cb->evbase, cb->timeout_cb, conn);
+  server->last_connect_ts = time(NULL);
+  conn->server = server;
 
-  conn->idle_ev = evtimer_new(cb->evbase, connection_idle_cb, conn);
+  conn->response_fd = response_fd;
+  conn->response_ev = event_new(cb->evbase, response_fd, EV_READ | EV_PERSIST, cb->response_cb, cb_arg);
+  conn->timeout_ev = evtimer_new(cb->evbase, cb->timeout_cb, cb_arg);
+
+  conn->idle_ev = evtimer_new(cb->evbase, tcp_connection_idle_cb, conn);
 
   conn->handshake_packets = evbuffer_new();
   conn->incoming = evbuffer_new();
@@ -339,47 +313,65 @@ connection_make(struct sp_connection *conn, const char *ap_avoid, struct sp_conn
   return 0;
 
  error:
+  server->last_failed_ts = time(NULL);
   return ret;
 }
 
+static int
+must_resolve(struct sp_server *server)
+{
+  time_t now = time(NULL);
+
+  return (server->last_resolved_ts == 0) || (server->last_failed_ts + SP_AP_AVOID_SECS > now);
+}
+
+void
+ap_disconnect(struct sp_connection *conn)
+{
+  if (conn->is_connected)
+    sp_cb.tcp_disconnect(conn->response_fd);
+
+  tcp_connection_clear(conn);
+}
+
 enum sp_error
-ap_connect(struct sp_connection *conn, enum sp_msg_type type, time_t *cooldown_ts, const char *ap_avoid, struct sp_conn_callbacks *cb, void *cb_arg)
+ap_connect(struct sp_connection *conn, struct sp_server *server, time_t *cooldown_ts, struct sp_conn_callbacks *cb, void *cb_arg)
 {
   int ret;
   time_t now;
 
-  if (!conn->is_connected)
-    {
-      // Protection against flooding the access points with reconnection attempts
-      // Note that cooldown_ts can't be part of the connection struct because
-      // the struct is reset between connection attempts.
-      now = time(NULL);
-      if (now > *cooldown_ts + SP_AP_COOLDOWN_SECS) // Last attempt was a long time ago
-	*cooldown_ts = now;
-      else if (now >= *cooldown_ts) // Last attempt was recent, so disallow more attempts for a while
-	*cooldown_ts = now + SP_AP_COOLDOWN_SECS;
-      else
-	RETURN_ERROR(SP_ERR_NOCONNECTION, "Cannot connect to access point, cooldown after disconnect is in effect");
+  if (must_resolve(server))
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Cannot connect to access point, it has recently failed");
 
-      ret = connection_make(conn, ap_avoid, cb, cb_arg);
-      if (ret < 0)
-	RETURN_ERROR(ret, sp_errmsg);
-    }
+  // Protection against flooding the access points with reconnection attempts
+  // Note that cooldown_ts can't be part of the connection struct because
+  // the struct is reset between connection attempts.
+  now = time(NULL);
+  if (now > *cooldown_ts + SP_AP_COOLDOWN_SECS) // Last attempt was a long time ago
+    *cooldown_ts = now;
+  else if (now >= *cooldown_ts) // Last attempt was recent, so disallow more attempts for a while
+    *cooldown_ts = now + SP_AP_COOLDOWN_SECS;
+  else
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Cannot connect to access point, cooldown after disconnect is in effect");
 
-  if (msg_is_handshake(type) || conn->handshake_completed)
-    return SP_OK_DONE; // Proceed right away
+  if (conn->is_connected)
+    ap_disconnect(conn);
 
-  return SP_OK_WAIT; // Caller must login again
+  ret = tcp_connection_make(conn, server, cb, cb_arg);
+  if (ret < 0)
+    RETURN_ERROR(ret, sp_errmsg);
+
+  return SP_OK_DONE;
 
  error:
   ap_disconnect(conn);
   return ret;
 }
 
-const char *
-ap_address_get(struct sp_connection *conn)
+void
+ap_blacklist(struct sp_server *server)
 {
-  return conn->ap_address;
+  server->last_failed_ts = time(NULL);
 }
 
 /* ------------------------------ Raw packets ------------------------------- */
@@ -561,17 +553,161 @@ mercury_parse(struct sp_mercury *mercury, uint8_t *payload, size_t payload_len)
 }
 
 
+/* ---------------------Request preparation (dependencies) ------------------ */
+
+static enum sp_error
+prepare_tcp_handshake(struct sp_seq_request *request, struct sp_conn_callbacks *cb, struct sp_session *session)
+{
+  int ret;
+
+  if (!session->conn.is_connected)
+    {
+      ret = ap_connect(&session->conn, &session->accesspoint, &session->cooldown_ts, cb, session);
+      if (ret == SP_ERR_NOCONNECTION)
+	{
+	  seq_next_set(session, request->seq_type);
+	  session->request = seq_request_get(SP_SEQ_LOGIN, 0, session->use_legacy);
+	  return SP_OK_WAIT;
+	}
+      else if (ret < 0)
+	RETURN_ERROR(ret, sp_errmsg);
+    }
+
+  return SP_OK_DONE;
+
+ error:
+  return ret;
+}
+
+static enum sp_error
+prepare_tcp(struct sp_seq_request *request, struct sp_conn_callbacks *cb, struct sp_session *session)
+{
+  int ret;
+
+  ret = prepare_tcp_handshake(request, cb, session);
+  if (ret != SP_OK_DONE)
+    return ret; // SP_OK_WAIT if the current AP failed and we need to try a new one
+
+  if (!session->conn.handshake_completed)
+    {
+      // Queue the current request
+      seq_next_set(session, request->seq_type);
+      session->request = seq_request_get(SP_SEQ_LOGIN, 0, session->use_legacy);
+      return SP_OK_WAIT;
+    }
+
+  return SP_OK_DONE;
+}
+
+
 /* --------------------------- Incoming messages ---------------------------- */
 
 static enum sp_error
-response_client_hello(uint8_t *msg, size_t msg_len, struct sp_session *session)
+resolve_server_info_set(struct sp_server *server, const char *key, json_object *jresponse)
 {
-  struct sp_connection *conn = &session->conn;
-  APResponseMessage *apresponse;
-  size_t header_len = 4; // TODO make a define
+  json_object *list;
+  json_object *instance;
+  size_t address_len;
+  const char *s;
+  char *colon;
+  bool is_same;
+  bool has_failed;
+  int ret;
+  int n;
+  int i;
+
+  has_failed = (server->last_failed_ts + SP_AP_AVOID_SECS > time(NULL));
+
+  if (! (json_object_object_get_ex(jresponse, key, &list) || json_object_get_type(list) == json_type_array))
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "No address list in response from access point resolver");
+
+  n = json_object_array_length(list);
+  for (i = 0, s = NULL; i < n && !s; i++)
+    {
+      instance = json_object_array_get_idx(list, i);
+      if (! (instance && json_object_get_type(instance) == json_type_string))
+        RETURN_ERROR(SP_ERR_NOCONNECTION, "Unexpected data in response from access point resolver");
+
+      s = json_object_get_string(instance); // This string includes the port
+      address_len = strlen(server->address);
+      is_same = (address_len > 0) && (strncmp(s, server->address, address_len) == 0);
+
+      if (is_same && has_failed)
+        s = NULL; // This AP has failed on us recently, so avoid
+    }
+
+  if (!s)
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Response from access port resolver had no valid servers");
+
+  if (!is_same)
+    {
+      memset(server, 0, sizeof(struct sp_server));
+      ret = snprintf(server->address, sizeof(server->address), "%s", s);
+      if (ret < 0 || ret >= sizeof(server->address))
+	RETURN_ERROR(SP_ERR_INVALID, "AP resolver returned an address that is too long");
+
+      colon = strchr(server->address, ':');
+      if (colon)
+        *colon = '\0';
+
+      server->port = colon ? (unsigned short)atoi(colon + 1) : 443;
+    }
+
+  server->last_resolved_ts = time(NULL);
+  return SP_OK_DONE;
+
+ error:
+  return ret;
+}
+
+static enum sp_error
+handle_ap_resolve(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_response *hres = &msg->payload.hres;
+  json_object *jresponse = NULL;
   int ret;
 
-  apresponse = apresponse_message__unpack(NULL, msg_len - header_len, msg + header_len);
+  if (hres->code != HTTP_OK)
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "AP resolver returned an error");
+
+  jresponse = json_tokener_parse((char *)hres->body);
+  if (!jresponse)
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Could not parse reply from access point resolver");
+
+  ret = resolve_server_info_set(&session->accesspoint, "accesspoint", jresponse);
+  if (ret < 0)
+    goto error;
+
+  ret = resolve_server_info_set(&session->spclient, "spclient", jresponse);
+  if (ret < 0)
+    goto error;
+
+  ret = resolve_server_info_set(&session->dealer, "dealer", jresponse);
+  if (ret < 0)
+    goto error;
+
+  json_object_put(jresponse);
+  return SP_OK_DONE;
+
+ error:
+  json_object_put(jresponse);
+  return ret;
+}
+
+static enum sp_error
+handle_client_hello(struct sp_message *msg, struct sp_session *session)
+{
+  uint8_t *payload = msg->payload.tmsg.data;
+  size_t payload_len = msg->payload.tmsg.len;
+  APResponseMessage *apresponse;
+  struct sp_connection *conn = &session->conn;
+  int ret;
+
+  // The first 4 bytes should be the size of the message
+  if (payload_len < 4)
+    RETURN_ERROR(SP_ERR_INVALID, "Invalid apresponse from access point");
+
+  apresponse = apresponse_message__unpack(NULL, payload_len - 4, payload + 4);
   if (!apresponse)
     RETURN_ERROR(SP_ERR_INVALID, "Could not unpack apresponse from access point");
 
@@ -597,7 +733,7 @@ response_client_hello(uint8_t *msg, size_t msg_len, struct sp_session *session)
 }
 
 static enum sp_error
-response_apwelcome(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_apwelcome(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   APWelcome *apwelcome;
   int ret;
@@ -627,7 +763,7 @@ response_apwelcome(uint8_t *payload, size_t payload_len, struct sp_session *sess
 }
 
 static enum sp_error
-response_aplogin_failed(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_aplogin_failed(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   APLoginFailed *aplogin_failed;
 
@@ -638,15 +774,7 @@ response_aplogin_failed(uint8_t *payload, size_t payload_len, struct sp_session 
       return SP_ERR_LOGINFAILED;
     }
 
-  sp_errmsg = "(unknown login error)";
-  for (int i = 0; i < sizeof(sp_login_errors)/sizeof(sp_login_errors[0]); i++)
-    {
-      if (sp_login_errors[i].errorcode != aplogin_failed->error_code)
-	continue;
-
-      sp_errmsg = sp_login_errors[i].errmsg;
-      break;
-    }
+  sp_errmsg = err2txt(aplogin_failed->error_code, sp_login_errors, ARRAY_SIZE(sp_login_errors));
 
   aplogin_failed__free_unpacked(aplogin_failed, NULL);
 
@@ -654,7 +782,7 @@ response_aplogin_failed(uint8_t *payload, size_t payload_len, struct sp_session 
 }
 
 static enum sp_error
-response_chunk_res(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_chunk_res(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   struct sp_channel *channel;
   uint16_t channel_id;
@@ -679,7 +807,7 @@ response_chunk_res(uint8_t *payload, size_t payload_len, struct sp_session *sess
 }
 
 static enum sp_error
-response_aes_key(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_aes_key(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   struct sp_channel *channel;
   const char *errmsg;
@@ -711,7 +839,7 @@ response_aes_key(uint8_t *payload, size_t payload_len, struct sp_session *sessio
 }
 
 static enum sp_error
-response_aes_key_error(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_aes_key_error(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   sp_errmsg = "Did not get key for decrypting track";
 
@@ -723,7 +851,7 @@ response_aes_key_error(uint8_t *payload, size_t payload_len, struct sp_session *
 // (see response_cb) retry with another access point. An example of this issue
 // is here https://github.com/librespot-org/librespot/issues/972
 static enum sp_error
-response_channel_error(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_channel_error(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   sp_errmsg = "The accces point returned a channel error";
 
@@ -731,7 +859,7 @@ response_channel_error(uint8_t *payload, size_t payload_len, struct sp_session *
 }
 
 static enum sp_error
-response_mercury_req(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_mercury_req(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   struct sp_mercury mercury = { 0 };
   struct sp_channel *channel;
@@ -768,7 +896,7 @@ response_mercury_req(uint8_t *payload, size_t payload_len, struct sp_session *se
 }
 
 static enum sp_error
-response_ping(uint8_t *payload, size_t payload_len, struct sp_session *session)
+handle_ping(uint8_t *payload, size_t payload_len, struct sp_session *session)
 {
   msg_pong(session);
 
@@ -776,46 +904,297 @@ response_ping(uint8_t *payload, size_t payload_len, struct sp_session *session)
 }
 
 static enum sp_error
-response_generic(uint8_t *msg, size_t msg_len, struct sp_session *session)
+handle_clienttoken(struct sp_message *msg, struct sp_session *session)
 {
-  enum sp_cmd_type cmd;
-  uint8_t *payload;
-  size_t payload_len;
+  struct http_response *hres = &msg->payload.hres;
+  struct sp_token *token = &session->http_clienttoken;
+  Spotify__Clienttoken__Http__V0__ClientTokenResponse *response = NULL;
   int ret;
 
-  cmd = msg[0];
-  payload = msg + 3;
-  payload_len = msg_len - 3 - 4;
+  if (hres->code != HTTP_OK)
+    RETURN_ERROR(SP_ERR_INVALID, "Request to clienttoken returned an error");
+
+  response = spotify__clienttoken__http__v0__client_token_response__unpack(NULL, hres->body_len, hres->body);
+  if (!response)
+    RETURN_ERROR(SP_ERR_INVALID, "Could not parse clienttoken response");
+
+  if (response->response_type == SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_TOKEN_RESPONSE_TYPE__RESPONSE_GRANTED_TOKEN_RESPONSE)
+    {
+      ret = snprintf(token->value, sizeof(token->value), "%s", response->granted_token->token);
+      if (ret < 0 || ret >= sizeof(token->value))
+	RETURN_ERROR(SP_ERR_INVALID, "Unexpected clienttoken length");
+
+      token->expires_after_seconds = response->granted_token->expires_after_seconds;
+      token->refresh_after_seconds = response->granted_token->refresh_after_seconds;
+      token->received_ts = time(NULL);
+    }
+  else if (response->response_type == SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_TOKEN_RESPONSE_TYPE__RESPONSE_CHALLENGES_RESPONSE)
+    RETURN_ERROR(SP_ERR_INVALID, "Unsupported clienttoken response");
+  else
+    RETURN_ERROR(SP_ERR_INVALID, "Unknown clienttoken response");
+
+  spotify__clienttoken__http__v0__client_token_response__free_unpacked(response, NULL);
+  return SP_OK_DONE;
+
+ error:
+  spotify__clienttoken__http__v0__client_token_response__free_unpacked(response, NULL);
+  return ret;
+}
+
+static void
+hashcash_challenges_free(struct crypto_hashcash_challenge **challenges, int *n_challenges)
+{
+  for (int i = 0; i < *n_challenges; i++)
+    free(challenges[i]->ctx);
+
+  free(*challenges);
+  *challenges = NULL;
+  *n_challenges = 0;
+}
+
+static enum sp_error
+handle_login5_challenges(Spotify__Login5__V3__Challenges *challenges, uint8_t *login_ctx, size_t login_ctx_len, struct sp_session *session)
+{
+  Spotify__Login5__V3__Challenge *this_challenge;
+  struct crypto_hashcash_challenge *crypto_challenge;
+  int ret;
+  int i;
+
+  session->n_hashcash_challenges = challenges->n_challenges;
+  session->hashcash_challenges = calloc(challenges->n_challenges, sizeof(struct crypto_hashcash_challenge));
+
+  for (i = 0, crypto_challenge = session->hashcash_challenges; i < session->n_hashcash_challenges; i++, crypto_challenge++)
+    {
+      this_challenge = challenges->challenges[i];
+
+      if (this_challenge->challenge_case != SPOTIFY__LOGIN5__V3__CHALLENGE__CHALLENGE_HASHCASH)
+	RETURN_ERROR(SP_ERR_INVALID, "Received unsupported login5 challenge");
+
+      if (this_challenge->hashcash->prefix.len != sizeof(crypto_challenge->prefix))
+	RETURN_ERROR(SP_ERR_INVALID, "Received hashcash challenge with unexpected prefix length");
+
+      crypto_challenge->ctx_len = login_ctx_len;
+      crypto_challenge->ctx = malloc(login_ctx_len);
+      memcpy(crypto_challenge->ctx, login_ctx, login_ctx_len);
+
+      memcpy(crypto_challenge->prefix, this_challenge->hashcash->prefix.data, sizeof(crypto_challenge->prefix));
+      crypto_challenge->wanted_zero_bits = this_challenge->hashcash->length;
+      crypto_challenge->max_iterations = HASHCASH_ITERATIONS_MAX;
+
+    }
+
+  return SP_OK_DONE;
+
+ error:
+  hashcash_challenges_free(&session->hashcash_challenges, &session->n_hashcash_challenges);
+  return ret;
+}
+
+static enum sp_error
+handle_login5(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_response *hres = &msg->payload.hres;
+  struct sp_token *token = &session->http_accesstoken;
+  Spotify__Login5__V3__LoginResponse *response = NULL;
+  int ret;
+  int i;
+
+  if (hres->code != HTTP_OK)
+    RETURN_ERROR(SP_ERR_INVALID, "Request to login5 returned an error");
+
+  response = spotify__login5__v3__login_response__unpack(NULL, hres->body_len, hres->body);
+  if (!response)
+    RETURN_ERROR(SP_ERR_INVALID, "Could not parse login5 response");
+
+  for (i = 0; i < response->n_warnings; i++)
+    sp_cb.logmsg("Got login5 warning '%s'", err2txt(response->warnings[i], sp_login5_warning_map, ARRAY_SIZE(sp_login5_warning_map)));
+
+  switch (response->response_case)
+    {
+      case SPOTIFY__LOGIN5__V3__LOGIN_RESPONSE__RESPONSE_OK:
+	ret = snprintf(token->value, sizeof(token->value), "%s", response->ok->access_token);
+	if (ret < 0 || ret >= sizeof(token->value))
+	  RETURN_ERROR(SP_ERR_INVALID, "Unexpected access_token length");
+
+	token->expires_after_seconds = response->ok->access_token_expires_in;
+	token->received_ts = time(NULL);
+	break;
+      case SPOTIFY__LOGIN5__V3__LOGIN_RESPONSE__RESPONSE_CHALLENGES:
+	sp_cb.logmsg("Login %zu challenges\n", response->challenges->n_challenges);
+	ret = handle_login5_challenges(response->challenges, response->login_context.data, response->login_context.len, session);
+	if (ret != SP_OK_DONE)
+	  goto error;
+	break;
+      case SPOTIFY__LOGIN5__V3__LOGIN_RESPONSE__RESPONSE_ERROR:
+	RETURN_ERROR(SP_ERR_LOGINFAILED, err2txt(response->error, sp_login5_error_map, ARRAY_SIZE(sp_login5_error_map)));
+      default:
+	RETURN_ERROR(SP_ERR_LOGINFAILED, "Login5 failed with unknown error type");
+    }
+
+  spotify__login5__v3__login_response__free_unpacked(response, NULL);
+  return SP_OK_DONE;
+
+ error:
+  spotify__login5__v3__login_response__free_unpacked(response, NULL);
+  return ret;
+}
+
+static enum sp_error
+handle_metadata_get(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_response *hres = &msg->payload.hres;
+  struct sp_channel *channel = session->now_streaming_channel;
+  Track *response = NULL;
+  int ret;
+
+  if (hres->code != HTTP_OK)
+    RETURN_ERROR(SP_ERR_INVALID, "Request for metadata returned an error");
+
+  // FIXME Use Episode object for file.media_type == SP_MEDIA_EPISODE
+  response = track__unpack(NULL, hres->body_len, hres->body);
+  if (!response)
+    RETURN_ERROR(SP_ERR_INVALID, "Could not parse metadata response");
+
+  ret = file_select(channel->file.id, sizeof(channel->file.id), response, session->bitrate_preferred);
+  if (ret < 0)
+    RETURN_ERROR(SP_ERR_INVALID, "Could not find track data");
+
+  track__free_unpacked(response, NULL);
+  return SP_OK_DONE;
+
+ error:
+  track__free_unpacked(response, NULL);
+  return ret;
+}
+
+static enum sp_error
+handle_storage_resolve(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_response *hres = &msg->payload.hres;
+  Spotify__Download__Proto__StorageResolveResponse *response = NULL;
+  struct sp_channel *channel = session->now_streaming_channel;
+  int i;
+  int ret;
+
+  if (hres->code != HTTP_OK)
+    RETURN_ERROR(SP_ERR_INVALID, "Request to storage-resolve returned an error");
+
+  response = spotify__download__proto__storage_resolve_response__unpack(NULL, hres->body_len, hres->body);
+  if (!response)
+    RETURN_ERROR(SP_ERR_INVALID, "Could not parse storage-resolve response");
+
+  switch (response->result)
+    {
+      case SPOTIFY__DOWNLOAD__PROTO__STORAGE_RESOLVE_RESPONSE__RESULT__CDN:
+        for (i = 0; i < response->n_cdnurl && i < ARRAY_SIZE(channel->file.cdnurl); i++)
+          channel->file.cdnurl[i] = strdup(response->cdnurl[i]);
+        break;
+      case SPOTIFY__DOWNLOAD__PROTO__STORAGE_RESOLVE_RESPONSE__RESULT__STORAGE:
+        RETURN_ERROR(SP_ERR_INVALID, "Track not available via CDN storage");
+      case SPOTIFY__DOWNLOAD__PROTO__STORAGE_RESOLVE_RESPONSE__RESULT__RESTRICTED:
+        RETURN_ERROR(SP_ERR_INVALID, "Can't resolve storage, track access restricted");
+      default:
+        RETURN_ERROR(SP_ERR_INVALID, "Can't resolve storage, unknown error");
+    }
+
+  spotify__download__proto__storage_resolve_response__free_unpacked(response, NULL);
+  return SP_OK_DONE;
+
+ error:
+  spotify__download__proto__storage_resolve_response__free_unpacked(response, NULL);
+  return ret;
+}
+
+static int
+file_size_get(struct sp_channel *channel, struct http_response *hres)
+{
+  char *content_range;
+  const char *colon;
+  int sz;
+
+  content_range = http_response_header_find("Content-Range", hres);
+  if (!content_range || !(colon = strchr(content_range, '/')))
+    return -1;
+
+  sz = atoi(colon + 1);
+  if (sz <= 0)
+    return -1;
+
+  channel->file.len_bytes = sz;
+  return 0;
+}
+
+// Ref. chunked_reader.go
+static enum sp_error
+handle_media_get(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_response *hres = &msg->payload.hres;
+  struct sp_channel *channel = session->now_streaming_channel;
+  int ret;
+
+  if (hres->code != HTTP_PARTIALCONTENT)
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Request for Spotify media returned an error");
+
+  if (channel->file.len_bytes == 0 && file_size_get(channel, hres) < 0)
+    RETURN_ERROR(SP_ERR_INVALID, "Invalid content-range, can't determine media size");
+
+  sp_cb.logmsg("Received %zu bytes, size is %d\n", hres->body_len, channel->file.len_bytes);
+
+  // Not sure if the channel concept even makes sense for http, but nonetheless
+  // we use it to stay consistent with the old tcp protocol
+  ret = channel_http_body_read(channel, hres->body, hres->body_len);
+  if (ret < 0)
+    goto error;
+
+  // Save any audio data to a buffer that will be written to audio_fd[1] when
+  // it is writable. Note that request for next chunk will also happen then.
+  evbuffer_add(channel->audio_buf, channel->body.data, channel->body.data_len);
+
+  return SP_OK_DATA;
+
+ error:
+  return ret;
+}
+
+static enum sp_error
+handle_tcp_generic(struct sp_message *msg, struct sp_session *session)
+{
+  uint8_t *data = msg->payload.tmsg.data;
+  size_t data_len = msg->payload.tmsg.len;
+  enum sp_cmd_type cmd = data[0];
+  uint8_t *payload = data + 3;
+  size_t payload_len = data_len - 3 - 4;
+  int ret;
 
   switch (cmd)
     {
       case CmdAPWelcome:
-	ret = response_apwelcome(payload, payload_len, session);
+	ret = handle_apwelcome(payload, payload_len, session);
 	break;
       case CmdAuthFailure:
-	ret = response_aplogin_failed(payload, payload_len, session);
+	ret = handle_aplogin_failed(payload, payload_len, session);
 	break;
       case CmdPing:
-	ret = response_ping(payload, payload_len, session);
+	ret = handle_ping(payload, payload_len, session);
 	break;
       case CmdStreamChunkRes:
-	ret = response_chunk_res(payload, payload_len, session);
+	ret = handle_chunk_res(payload, payload_len, session);
 	break;
       case CmdCountryCode:
 	memcpy(session->country, payload, sizeof(session->country) - 1);
 	ret = SP_OK_OTHER;
 	break;
       case CmdAesKey:
-	ret = response_aes_key(payload, payload_len, session);
+	ret = handle_aes_key(payload, payload_len, session);
 	break;
       case CmdAesKeyError:
-	ret = response_aes_key_error(payload, payload_len, session);
+	ret = handle_aes_key_error(payload, payload_len, session);
 	break;
       case CmdMercuryReq:
-	ret = response_mercury_req(payload, payload_len, session);
+	ret = handle_mercury_req(payload, payload_len, session);
 	break;
       case CmdChannelError:
-        ret = response_channel_error(payload, payload_len, session);
+        ret = handle_channel_error(payload, payload_len, session);
         break;
       case CmdLegacyWelcome: // 0 bytes, ignored by librespot
       case CmdSecretBlock: // ignored by librespot
@@ -829,8 +1208,59 @@ response_generic(uint8_t *msg, size_t msg_len, struct sp_session *session)
 }
 
 static enum sp_error
-msg_read_one(uint8_t **out, size_t *out_len, uint8_t *in, size_t in_len, struct sp_connection *conn)
+msg_tcp_handle(struct sp_message *msg, struct sp_session *session)
 {
+  struct sp_seq_request *request = session->request;
+
+  // We have a tcp request waiting for a response
+  if (request && request->proto == SP_PROTO_TCP && request->response_handler)
+    {
+//      sp_cb.logmsg("Handling response to %s\n", request->name);
+      return request->response_handler(msg, session);
+    }
+
+//  sp_cb.logmsg("Handling incoming tcp message\n");
+  // Not waiting for anything, could be a ping
+  return handle_tcp_generic(msg, session);
+}
+
+static enum sp_error
+msg_http_handle(struct sp_message *msg, struct sp_session *session)
+{
+  struct sp_seq_request *request = session->request;
+
+  // We have a http request waiting for a response
+  if (request && request->proto == SP_PROTO_HTTP && request->response_handler)
+    {
+//      sp_cb.logmsg("Handling response to %s\n", request->name);
+      return request->response_handler(msg, session);
+    }
+
+  sp_errmsg = "Received unexpected http response";
+  return SP_ERR_INVALID;
+}
+
+// Handler must return SP_OK_DONE if the message is a response to a request.
+// It must return SP_OK_OTHER if the message is something else (e.g. a ping),
+// SP_ERR_xxx if the response indicates an error. Finally, SP_OK_DATA is like
+// DONE except it also means that there is new audio data to write.
+enum sp_error
+msg_handle(struct sp_message *msg, struct sp_session *session)
+{
+  if (msg->type == SP_MSG_TYPE_TCP)
+    return msg_tcp_handle(msg, session);
+  else if (msg->type == SP_MSG_TYPE_HTTP_RES)
+    return msg_http_handle(msg, session);
+
+  sp_errmsg = "Invalid message passed to msg_handle()";
+  return SP_ERR_INVALID;
+}
+
+enum sp_error
+msg_tcp_read_one(struct sp_tcp_message *tmsg, struct sp_connection *conn)
+{
+  size_t in_len = evbuffer_get_length(conn->incoming);
+  uint8_t *in = evbuffer_pullup(conn->incoming, -1);
   uint32_t be32;
   ssize_t msg_len;
   int ret;
@@ -844,9 +1274,9 @@ msg_read_one(uint8_t **out, size_t *out_len, uint8_t *in, size_t in_len, struct 
       if (msg_len > in_len)
 	return SP_OK_WAIT;
 
-      *out = malloc(msg_len);
-      *out_len = msg_len;
-      evbuffer_remove(conn->incoming, *out, msg_len);
+      tmsg->data = malloc(msg_len);
+      tmsg->len = msg_len;
+      evbuffer_remove(conn->incoming, tmsg->data, msg_len);
 
       return SP_OK_DONE;
     }
@@ -877,49 +1307,11 @@ msg_read_one(uint8_t **out, size_t *out_len, uint8_t *in, size_t in_len, struct 
     }
 
   // At this point we have a complete, decrypted message.
-  *out = malloc(msg_len);
-  *out_len = msg_len;
-  evbuffer_remove(conn->incoming, *out, msg_len);
+  tmsg->data = malloc(msg_len);
+  tmsg->len = msg_len;
+  evbuffer_remove(conn->incoming, tmsg->data, msg_len);
 
   return SP_OK_DONE;
-
- error:
-  return ret;
-}
-
-enum sp_error
-response_read(struct sp_session *session)
-{
-  struct sp_connection *conn = &session->conn;
-  uint8_t *in;
-  size_t in_len;
-  uint8_t *msg;
-  size_t msg_len;
-  int ret;
-
-  in_len = evbuffer_get_length(conn->incoming);
-  in = evbuffer_pullup(conn->incoming, -1);
-
-  ret = msg_read_one(&msg, &msg_len, in, in_len, conn);
-  if (ret != SP_OK_DONE)
-    goto error;
-
-  if (msg_len < 128)
-    sp_cb.hexdump("Received message\n", msg, msg_len);
-  else
-    sp_cb.hexdump("Received message (truncated)\n", msg, 128);
-
-  if (!session->response_handler)
-    RETURN_ERROR(SP_ERR_INVALID, "Unexpected response from Spotify, aborting");
-
-  // Handler must return SP_OK_DONE if the message is a response to a request.
-  // It must return SP_OK_OTHER if the message is something else (e.g. a ping),
-  // SP_ERR_xxx if the response indicates an error. Finally, SP_OK_DATA is like
-  // DONE except it also means that there is new audio data to write.
-  ret = session->response_handler(msg, msg_len, session);
-  free(msg);
-
-  return ret;
 
  error:
   return ret;
@@ -928,10 +1320,23 @@ response_read(struct sp_session *session)
 
 /* --------------------------- Outgoing messages ---------------------------- */
 
-// This message is constructed like librespot does it, see handshake.rs
-static ssize_t
-msg_make_client_hello(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_ap_resolve(struct sp_message *msg, struct sp_session *session)
 {
+  struct http_request *hreq = &msg->payload.hreq;
+
+  if (!must_resolve(&session->accesspoint) && !must_resolve(&session->spclient) && !must_resolve(&session->dealer))
+    return 1; // Skip
+
+  hreq->url = strdup("https://apresolve.spotify.com/?type=accesspoint&type=spclient&type=dealer");
+  return 0;
+}
+
+// This message is constructed like librespot does it, see handshake.rs
+static int
+msg_make_client_hello(struct sp_message *msg, struct sp_session *session)
+{
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
   ClientHello client_hello = CLIENT_HELLO__INIT;
   BuildInfo build_info = BUILD_INFO__INIT;
   LoginCryptoHelloUnion login_crypto = LOGIN_CRYPTO_HELLO_UNION__INIT;
@@ -939,7 +1344,6 @@ msg_make_client_hello(uint8_t *out, size_t out_len, struct sp_session *session)
   Cryptosuite crypto_suite = CRYPTOSUITE__CRYPTO_SUITE_SHANNON;
   uint8_t padding[1] = { 0x1e };
   uint8_t nonce[16] = { 0 };
-  size_t len;
 
   build_info.product = PRODUCT__PRODUCT_PARTNER;
   build_info.platform = PLATFORM__PLATFORM_LINUX_X86;
@@ -961,13 +1365,14 @@ msg_make_client_hello(uint8_t *out, size_t out_len, struct sp_session *session)
   client_hello.padding.len = sizeof(padding);
   client_hello.padding.data = padding;
 
-  len = client_hello__get_packed_size(&client_hello);
-  if (len > out_len)
-    return -1;
+  tmsg->len = client_hello__get_packed_size(&client_hello);
+  tmsg->data = malloc(tmsg->len);
 
-  client_hello__pack(&client_hello, out);
+  client_hello__pack(&client_hello, tmsg->data);
 
-  return len;
+  tmsg->add_version_header = true;
+
+  return 0;
 }
 
 static int
@@ -992,15 +1397,15 @@ client_response_crypto(uint8_t **challenge, size_t *challenge_len, struct sp_con
   return ret;
 }
 
-static ssize_t
-msg_make_client_response_plaintext(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_client_response_plaintext(struct sp_message *msg, struct sp_session *session)
 {
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
   ClientResponsePlaintext client_response = CLIENT_RESPONSE_PLAINTEXT__INIT;
   LoginCryptoResponseUnion login_crypto_response = LOGIN_CRYPTO_RESPONSE_UNION__INIT;
   LoginCryptoDiffieHellmanResponse diffie_hellman = LOGIN_CRYPTO_DIFFIE_HELLMAN_RESPONSE__INIT;
   uint8_t *challenge;
   size_t challenge_len;
-  ssize_t len;
   int ret;
 
   ret = client_response_crypto(&challenge, &challenge_len, &session->conn);
@@ -1014,28 +1419,24 @@ msg_make_client_response_plaintext(uint8_t *out, size_t out_len, struct sp_sessi
 
   client_response.login_crypto_response = &login_crypto_response;
 
-  len = client_response_plaintext__get_packed_size(&client_response);
-  if (len > out_len)
-    {
-      free(challenge);
-      return -1;
-    }
+  tmsg->len = client_response_plaintext__get_packed_size(&client_response);
+  tmsg->data = malloc(tmsg->len);
 
-  client_response_plaintext__pack(&client_response, out);
+  client_response_plaintext__pack(&client_response, tmsg->data);
 
   free(challenge);
-  return len;
+  return 0;
 }
 
-static ssize_t
-msg_make_client_response_encrypted(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_client_response_encrypted(struct sp_message *msg, struct sp_session *session)
 {
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
   ClientResponseEncrypted client_response = CLIENT_RESPONSE_ENCRYPTED__INIT;
   LoginCredentials login_credentials = LOGIN_CREDENTIALS__INIT;
   SystemInfo system_info = SYSTEM_INFO__INIT;
   char system_information_string[64];
   char version_string[64];
-  ssize_t len;
 
   login_credentials.has_auth_data = 1;
   login_credentials.username = session->credentials.username;
@@ -1076,21 +1477,23 @@ msg_make_client_response_encrypted(uint8_t *out, size_t out_len, struct sp_sessi
   client_response.system_info = &system_info;
   client_response.version_string = version_string;
 
-  len = client_response_encrypted__get_packed_size(&client_response);
-  if (len > out_len)
-    return -1;
+  tmsg->len = client_response_encrypted__get_packed_size(&client_response);
+  tmsg->data = malloc(tmsg->len);
 
-  client_response_encrypted__pack(&client_response, out);
+  client_response_encrypted__pack(&client_response, tmsg->data);
 
-  return len;
+  tmsg->cmd = CmdLogin;
+  tmsg->encrypt = true;
+
+  return 0;
 }
 
 // From librespot-golang:
 // Mercury is the protocol implementation for Spotify Connect playback control and metadata fetching. It works as a
 // PUB/SUB system, where you, as an audio sink, subscribes to the events of a specified user (playlist changes) but
 // also access various metadata normally fetched by external players (tracks metadata, playlists, artists, etc).
-static ssize_t
-msg_make_mercury_req(uint8_t *out, size_t out_len, struct sp_mercury *mercury)
+static int
+msg_make_mercury_req(size_t *total_len, uint8_t *out, size_t out_len, struct sp_mercury *mercury)
 {
   Header header = HEADER__INIT;
   uint8_t *ptr;
@@ -1158,12 +1561,14 @@ msg_make_mercury_req(uint8_t *out, size_t out_len, struct sp_mercury *mercury)
 
   assert(ptr - out == header_len + prefix_len + body_len);
 
-  return header_len + prefix_len + body_len;
+  *total_len = header_len + prefix_len + body_len;
+  return 0;
 }
 
-static ssize_t
-msg_make_mercury_track_get(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_mercury_track_get(struct sp_message *msg, struct sp_session *session)
 {
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
   struct sp_mercury mercury = { 0 };
   struct sp_channel *channel = session->now_streaming_channel;
   char uri[256];
@@ -1182,12 +1587,17 @@ msg_make_mercury_track_get(uint8_t *out, size_t out_len, struct sp_session *sess
   mercury.seq    = channel->id;
   mercury.uri    = uri;
 
-  return msg_make_mercury_req(out, out_len, &mercury);
+  tmsg->data = malloc(MERCURY_REQ_SIZE_MAX);
+  tmsg->cmd = CmdMercuryReq;
+  tmsg->encrypt = true;
+
+  return msg_make_mercury_req(&tmsg->len, tmsg->data, MERCURY_REQ_SIZE_MAX, &mercury);
 }
 
-static ssize_t
-msg_make_mercury_episode_get(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_mercury_episode_get(struct sp_message *msg, struct sp_session *session)
 {
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
   struct sp_mercury mercury = { 0 };
   struct sp_channel *channel = session->now_streaming_channel;
   char uri[256];
@@ -1206,24 +1616,39 @@ msg_make_mercury_episode_get(uint8_t *out, size_t out_len, struct sp_session *se
   mercury.seq    = channel->id;
   mercury.uri    = uri;
 
-  return msg_make_mercury_req(out, out_len, &mercury);
+  tmsg->data = malloc(MERCURY_REQ_SIZE_MAX);
+  tmsg->cmd = CmdMercuryReq;
+  tmsg->encrypt = true;
+
+  return msg_make_mercury_req(&tmsg->len, tmsg->data, MERCURY_REQ_SIZE_MAX, &mercury);
 }
 
-static ssize_t
-msg_make_audio_key_get(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_mercury_metadata_get(struct sp_message *msg, struct sp_session *session)
 {
   struct sp_channel *channel = session->now_streaming_channel;
-  size_t required_len;
+
+  if (channel->file.media_type == SP_MEDIA_TRACK)
+    return msg_make_mercury_track_get(msg, session);
+  else if (channel->file.media_type == SP_MEDIA_EPISODE)
+    return msg_make_mercury_episode_get(msg, session);
+
+  return -1;
+}
+
+static int
+msg_make_audio_key_get(struct sp_message *msg, struct sp_session *session)
+{
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
+  struct sp_channel *channel = session->now_streaming_channel;
+  uint8_t *ptr;
   uint32_t be32;
   uint16_t be;
-  uint8_t *ptr;
 
-  required_len = sizeof(channel->file.id) + sizeof(channel->file.media_id) + sizeof(be32) + sizeof(be);
+  tmsg->len = sizeof(channel->file.id) + sizeof(channel->file.media_id) + sizeof(be32) + sizeof(be);
+  tmsg->data = malloc(tmsg->len);
 
-  if (required_len > out_len)
-    return -1;
-
-  ptr = out;
+  ptr = tmsg->data;
 
   memcpy(ptr, channel->file.id, sizeof(channel->file.id));
   ptr += sizeof(channel->file.id);
@@ -1239,26 +1664,28 @@ msg_make_audio_key_get(uint8_t *out, size_t out_len, struct sp_session *session)
   memcpy(ptr, &be, sizeof(be));
   ptr += sizeof(be);
 
-  return required_len;
+  tmsg->cmd = CmdRequestKey;
+  tmsg->encrypt = true;
+
+  return 0;
 }
 
-static ssize_t
-msg_make_chunk_request(uint8_t *out, size_t out_len, struct sp_session *session)
+static int
+msg_make_chunk_request(struct sp_message *msg, struct sp_session *session)
 {
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
   struct sp_channel *channel = session->now_streaming_channel;
   uint8_t *ptr;
   uint16_t be;
   uint32_t be32;
-  size_t required_len;
 
   if (!channel)
     return -1;
 
-  ptr = out;
+  tmsg->len = 3 * sizeof(be) + sizeof(channel->file.id) + 5 * sizeof(be32);
+  tmsg->data = malloc(tmsg->len);
 
-  required_len = 3 * sizeof(be) + sizeof(channel->file.id) + 5 * sizeof(be32);
-  if (required_len > out_len)
-    return -1;
+  ptr = tmsg->data;
 
   be = htobe16(channel->id);
   memcpy(ptr, &be, sizeof(be));
@@ -1287,104 +1714,490 @@ msg_make_chunk_request(uint8_t *out, size_t out_len, struct sp_session *session)
   memcpy(ptr, channel->file.id, sizeof(channel->file.id));
   ptr += sizeof(channel->file.id);
 
-  be32 = htobe32(channel->file.offset_words);
+  be32 = htobe32(channel->file.offset_bytes / 4);
   memcpy(ptr, &be32, sizeof(be32));
   ptr += sizeof(be32); // x4
 
-  be32 = htobe32(channel->file.offset_words + SP_CHUNK_LEN_WORDS);
+  be32 = htobe32(channel->file.offset_bytes / 4 + SP_CHUNK_LEN / 4);
   memcpy(ptr, &be32, sizeof(be32));
   ptr += sizeof(be32); // x5
 
-  assert(required_len == ptr - out);
-  assert(required_len == 46);
+  assert(tmsg->len == ptr - tmsg->data);
+  assert(tmsg->len == 46);
 
-  return required_len;
+  tmsg->cmd = CmdStreamChunk;
+  tmsg->encrypt = true;
+
+  return 0;
 }
 
-bool
-msg_is_handshake(enum sp_msg_type type)
+static int
+msg_make_pong(struct sp_message *msg, struct sp_session *session)
 {
-  return ( type == MSG_TYPE_CLIENT_HELLO ||
-           type == MSG_TYPE_CLIENT_RESPONSE_PLAINTEXT ||
-           type == MSG_TYPE_CLIENT_RESPONSE_ENCRYPTED );
+  struct sp_tcp_message *tmsg = &msg->payload.tmsg;
+
+  tmsg->len = 4;
+  tmsg->data = calloc(1, tmsg->len); // librespot just replies with zeroes
+
+  tmsg->cmd = CmdPong;
+  tmsg->encrypt = true;
+
+  return 0;
 }
 
-int
-msg_make(struct sp_message *msg, enum sp_msg_type type, struct sp_session *session)
+// Ref. session/clienttoken.go
+static int
+msg_make_clienttoken(struct sp_message *msg, struct sp_session *session)
 {
-  memset(msg, 0, sizeof(struct sp_message));
-  msg->type = type;
+  struct http_request *hreq = &msg->payload.hreq;
+  Spotify__Clienttoken__Http__V0__ClientTokenRequest treq = SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_TOKEN_REQUEST__INIT;
+  Spotify__Clienttoken__Http__V0__ClientDataRequest dreq = SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_DATA_REQUEST__INIT;
+  Spotify__Clienttoken__Data__V0__ConnectivitySdkData sdk_data = SPOTIFY__CLIENTTOKEN__DATA__V0__CONNECTIVITY_SDK_DATA__INIT;
+  Spotify__Clienttoken__Data__V0__PlatformSpecificData platform_data = SPOTIFY__CLIENTTOKEN__DATA__V0__PLATFORM_SPECIFIC_DATA__INIT;
+  struct sp_token *token = &session->http_clienttoken;
+  time_t now = time(NULL);
+  bool must_refresh;
 
-  switch (type)
+  must_refresh = (now > token->received_ts + token->expires_after_seconds) || (now > token->received_ts + token->refresh_after_seconds);
+  if (!must_refresh)
+    return 1; // We have a valid token, tell caller to go to next request
+
+#ifdef HAVE_SYS_UTSNAME_H
+  Spotify__Clienttoken__Data__V0__NativeDesktopMacOSData desktop_macos = SPOTIFY__CLIENTTOKEN__DATA__V0__NATIVE_DESKTOP_MAC_OSDATA__INIT;
+  Spotify__Clienttoken__Data__V0__NativeDesktopLinuxData desktop_linux = SPOTIFY__CLIENTTOKEN__DATA__V0__NATIVE_DESKTOP_LINUX_DATA__INIT;
+  struct utsname uts = { 0 };
+
+  uname(&uts);
+  if (strcmp(uts.sysname, "Linux") == 0)
     {
-      case MSG_TYPE_CLIENT_HELLO:
-	msg->len = msg_make_client_hello(msg->data, sizeof(msg->data), session);
-	msg->type_next = MSG_TYPE_CLIENT_RESPONSE_PLAINTEXT;
-	msg->add_version_header = true;
-	msg->response_handler = response_client_hello;
-	break;
-      case MSG_TYPE_CLIENT_RESPONSE_PLAINTEXT:
-	msg->len = msg_make_client_response_plaintext(msg->data, sizeof(msg->data), session);
-	msg->type_next = MSG_TYPE_CLIENT_RESPONSE_ENCRYPTED;
-	msg->response_handler = NULL; // No response expected
-	break;
-      case MSG_TYPE_CLIENT_RESPONSE_ENCRYPTED:
-	msg->len = msg_make_client_response_encrypted(msg->data, sizeof(msg->data), session);
-	msg->cmd = CmdLogin;
-        msg->encrypt = true;
-	msg->response_handler = response_generic;
-	break;
-      case MSG_TYPE_MERCURY_TRACK_GET:
-	msg->len = msg_make_mercury_track_get(msg->data, sizeof(msg->data), session);
-	msg->cmd = CmdMercuryReq;
-        msg->encrypt = true;
-	msg->type_next = MSG_TYPE_AUDIO_KEY_GET;
-	msg->response_handler = response_generic;
-	break;
-      case MSG_TYPE_MERCURY_EPISODE_GET:
-	msg->len = msg_make_mercury_episode_get(msg->data, sizeof(msg->data), session);
-	msg->cmd = CmdMercuryReq;
-        msg->encrypt = true;
-	msg->type_next = MSG_TYPE_AUDIO_KEY_GET;
-	msg->response_handler = response_generic;
-	break;
-      case MSG_TYPE_AUDIO_KEY_GET:
-	msg->len = msg_make_audio_key_get(msg->data, sizeof(msg->data), session);
-	msg->cmd = CmdRequestKey;
-        msg->encrypt = true;
-	msg->type_next = MSG_TYPE_CHUNK_REQUEST;
-	msg->response_handler = response_generic;
-	break;
-      case MSG_TYPE_CHUNK_REQUEST:
-	msg->len = msg_make_chunk_request(msg->data, sizeof(msg->data), session);
-	msg->cmd = CmdStreamChunk;
-        msg->encrypt = true;
-	msg->response_handler = response_generic;
-	break;
-      case MSG_TYPE_PONG:
-	msg->len = 4;
-	msg->cmd = CmdPong;
-        msg->encrypt = true;
-	memset(msg->data, 0, msg->len); // librespot just replies with zeroes
-	break;
-      default:
-	msg->len = -1;
+      desktop_linux.system_name = uts.sysname;
+      desktop_linux.system_release = uts.release;
+      desktop_linux.system_version = uts.version;
+      desktop_linux.hardware = uts.machine;
+      platform_data.desktop_linux = &desktop_linux;
+      platform_data.data_case = SPOTIFY__CLIENTTOKEN__DATA__V0__PLATFORM_SPECIFIC_DATA__DATA_DESKTOP_LINUX;
+    }
+  else if (strcmp(uts.sysname, "Darwin") == 0)
+    {
+      desktop_macos.system_version = uts.version;
+      desktop_macos.hw_model = uts.machine;
+      desktop_macos.compiled_cpu_type = uts.machine;
+      platform_data.desktop_macos = &desktop_macos;
+      platform_data.data_case = SPOTIFY__CLIENTTOKEN__DATA__V0__PLATFORM_SPECIFIC_DATA__DATA_DESKTOP_MACOS;
+    }
+#endif
+
+  sdk_data.platform_specific_data = &platform_data;
+  sdk_data.device_id = sp_sysinfo.device_id; // e.g. "bcbae1f3062baac486045f13935c6c95ad4191ff"
+
+  dreq.connectivity_sdk_data = &sdk_data;
+  dreq.data_case = SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_DATA_REQUEST__DATA_CONNECTIVITY_SDK_DATA;
+  dreq.client_version = sp_sysinfo.client_version; // e.g. "0.0.0" (SpotifyLikeClient)
+  dreq.client_id = sp_sysinfo.client_id;
+
+  treq.client_data = &dreq;
+  treq.request_type = SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_TOKEN_REQUEST_TYPE__REQUEST_CLIENT_DATA_REQUEST;
+  treq.request_case = SPOTIFY__CLIENTTOKEN__HTTP__V0__CLIENT_TOKEN_REQUEST__REQUEST_CLIENT_DATA;
+
+  hreq->body_len = spotify__clienttoken__http__v0__client_token_request__get_packed_size(&treq);
+  hreq->body = malloc(hreq->body_len);
+
+  spotify__clienttoken__http__v0__client_token_request__pack(&treq, hreq->body);
+
+  hreq->url = strdup("https://clienttoken.spotify.com/v1/clienttoken");
+
+  hreq->headers[0] = strdup("Accept: application/x-protobuf");
+  hreq->headers[1] = strdup("Content-Type: application/x-protobuf");
+
+  return 0;
+}
+
+static void
+challenge_solutions_clear(Spotify__Login5__V3__ChallengeSolutions *solutions)
+{
+  Spotify__Login5__V3__ChallengeSolution *this_solution;
+  int i;
+
+  if (!solutions->solutions)
+    return;
+
+  for (i = 0; i < solutions->n_solutions; i++)
+    {
+      this_solution = solutions->solutions[i];
+      if (!this_solution)
+	continue;
+
+      free(this_solution->hashcash->duration);
+      free(this_solution->hashcash->suffix.data);
+      free(this_solution->hashcash);
+      free(this_solution);
     }
 
-  return (msg->len < 0) ? -1 : 0;
+  free(solutions->solutions);
+}
+
+// Finds solutions to the challenges stored in *challenges and adds them to *solutions
+static int
+challenge_solutions_append(Spotify__Login5__V3__ChallengeSolutions *solutions, struct crypto_hashcash_challenge *challenges, int n_challenges)
+{
+  Spotify__Login5__V3__ChallengeSolution *this_solution;
+  struct crypto_hashcash_challenge *crypto_challenge;
+  struct crypto_hashcash_solution crypto_solution;
+  size_t suffix_len = sizeof(crypto_solution.suffix);
+  int ret;
+  int i;
+
+  solutions->n_solutions = n_challenges;
+  solutions->solutions = calloc(n_challenges, sizeof(Spotify__Login5__V3__ChallengeSolution *));
+  if (!solutions->solutions)
+    RETURN_ERROR(SP_ERR_OOM, "Out of memory allocating hashcash solutions");
+
+  for (i = 0, crypto_challenge = challenges; i < n_challenges; i++, crypto_challenge++)
+    {
+      ret = crypto_hashcash_solve(&crypto_solution, crypto_challenge, &sp_errmsg);
+      if (ret < 0)
+	RETURN_ERROR(SP_ERR_INVALID, sp_errmsg);
+
+      this_solution = malloc(sizeof(Spotify__Login5__V3__ChallengeSolution));
+      spotify__login5__v3__challenge_solution__init(this_solution);
+      this_solution->solution_case = SPOTIFY__LOGIN5__V3__CHALLENGE_SOLUTION__SOLUTION_HASHCASH;
+
+      this_solution->hashcash = malloc(sizeof(Spotify__Login5__V3__Challenges__HashcashSolution));
+      spotify__login5__v3__challenges__hashcash_solution__init(this_solution->hashcash);
+
+      this_solution->hashcash->duration = malloc(sizeof(Google__Protobuf__Duration));
+      google__protobuf__duration__init(this_solution->hashcash->duration);
+
+      this_solution->hashcash->suffix.len = suffix_len;
+      this_solution->hashcash->suffix.data = malloc(suffix_len);
+      memcpy(this_solution->hashcash->suffix.data, crypto_solution.suffix, suffix_len);
+
+      this_solution->hashcash->duration->seconds = crypto_solution.duration.tv_sec;
+      this_solution->hashcash->duration->nanos = crypto_solution.duration.tv_nsec;
+
+      solutions->solutions[i] = this_solution;
+    }
+
+  return 0;
+
+ error:
+  challenge_solutions_clear(solutions);
+  return ret;
+}
+
+// Ref. login5/login5.go
+static int
+msg_make_login5(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_request *hreq = &msg->payload.hreq;
+  Spotify__Login5__V3__LoginRequest req = SPOTIFY__LOGIN5__V3__LOGIN_REQUEST__INIT;
+  Spotify__Login5__V3__ChallengeSolutions solutions = SPOTIFY__LOGIN5__V3__CHALLENGE_SOLUTIONS__INIT;
+  Spotify__Login5__V3__ClientInfo client_info = SPOTIFY__LOGIN5__V3__CLIENT_INFO__INIT;
+  Spotify__Login5__V3__Credentials__StoredCredential stored_credential = SPOTIFY__LOGIN5__V3__CREDENTIALS__STORED_CREDENTIAL__INIT;
+  struct sp_token *token = &session->http_accesstoken;
+  uint8_t *login_context = NULL;
+  size_t login_context_len;
+  time_t now = time(NULL);
+  bool must_refresh;
+  int ret;
+
+  must_refresh = (now > token->received_ts + token->expires_after_seconds);
+  if (!must_refresh)
+    return 1; // We have a valid token, tell caller to go to next request
+
+  if (session->credentials.stored_cred_len == 0)
+    return -1;
+
+  // This is our second login5 request - Spotify returned challenges after the first.
+  // The login_context is echoed from Spotify's response to the first login5.
+  if (session->hashcash_challenges)
+    {
+      login_context_len = session->hashcash_challenges->ctx_len;
+      login_context = malloc(login_context_len);
+      memcpy(login_context, session->hashcash_challenges->ctx, login_context_len);
+
+      ret = challenge_solutions_append(&solutions, session->hashcash_challenges, session->n_hashcash_challenges);
+      hashcash_challenges_free(&session->hashcash_challenges, &session->n_hashcash_challenges);
+      if (ret < 0)
+	goto error;
+
+      req.challenge_solutions = &solutions;
+      req.login_context.data = login_context;
+      req.login_context.len = login_context_len;
+    }
+
+  client_info.client_id = sp_sysinfo.client_id;
+  client_info.device_id = sp_sysinfo.device_id;
+
+  req.client_info = &client_info;
+
+  stored_credential.username = session->credentials.username;
+  stored_credential.data.data = session->credentials.stored_cred;
+  stored_credential.data.len = session->credentials.stored_cred_len;
+
+  req.login_method_case = SPOTIFY__LOGIN5__V3__LOGIN_REQUEST__LOGIN_METHOD_STORED_CREDENTIAL;
+  req.stored_credential = &stored_credential;
+
+  hreq->body_len = spotify__login5__v3__login_request__get_packed_size(&req);
+  hreq->body = malloc(hreq->body_len);
+
+  spotify__login5__v3__login_request__pack(&req, hreq->body);
+
+  hreq->url = strdup("https://login5.spotify.com/v3/login");
+
+  hreq->headers[0] = asprintf_or_die("Accept: application/x-protobuf");
+  hreq->headers[1] = asprintf_or_die("Content-Type: application/x-protobuf");
+  hreq->headers[2] = asprintf_or_die("Client-Token: %s", session->http_clienttoken.value);
+
+  challenge_solutions_clear(&solutions);
+  free(login_context);
+  return 0;
+
+ error:
+  challenge_solutions_clear(&solutions);
+  free(login_context);
+  return -1;
+}
+
+static int
+msg_make_login5_challenges(struct sp_message *msg, struct sp_session *session)
+{
+  // Spotify didn't give us any challenges during login5, so we can just proceed
+  if (!session->hashcash_challenges)
+    return 1; // Continue to next message
+
+  // Otherwise make another login5 request that includes the challenge responses
+  return msg_make_login5(msg, session);
+}
+
+// Ref. spclient/spclient.go
+static int
+msg_make_metadata_get(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_request *hreq = &msg->payload.hreq;
+  struct sp_server *server = &session->spclient;
+  struct sp_channel *channel = session->now_streaming_channel;
+  const char *path;
+  char *media_id = NULL;
+  char *ptr;
+  int i;
+
+  if (channel->file.media_type == SP_MEDIA_TRACK)
+    path = "metadata/4/track";
+  else if (channel->file.media_type == SP_MEDIA_EPISODE)
+    path = "metadata/4/episode";
+  else
+    return -1;
+
+  media_id = malloc(2 * sizeof(channel->file.media_id) + 1);
+  for (i = 0, ptr = media_id; i < sizeof(channel->file.media_id); i++)
+    ptr += sprintf(ptr, "%02x", channel->file.media_id[i]);
+
+  hreq->url = asprintf_or_die("https://%s:%d/%s/%s", server->address, server->port, path, media_id);
+
+  hreq->headers[0] = asprintf_or_die("Accept: application/x-protobuf");
+  hreq->headers[1] = asprintf_or_die("Client-Token: %s", session->http_clienttoken.value);
+  hreq->headers[2] = asprintf_or_die("Authorization: Bearer %s", session->http_accesstoken.value);
+
+  free(media_id);
+  return 0;
+}
+
+// Resolve storage, this will just be a GET request
+// Ref. spclient/spclient.go
+static int
+msg_make_storage_resolve(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_request *hreq = &msg->payload.hreq;
+  struct sp_server *server = &session->spclient;
+  struct sp_channel *channel = session->now_streaming_channel;
+  char *track_id = NULL;
+  char *ptr;
+  int i;
+
+  track_id = malloc(2 * sizeof(channel->file.id) + 1);
+  for (i = 0, ptr = track_id; i < sizeof(channel->file.id); i++)
+    ptr += sprintf(ptr, "%02x", channel->file.id[i]);
+
+  hreq->url = asprintf_or_die("https://%s:%d/storage-resolve/files/audio/interactive/%s", server->address, server->port, track_id);
+
+  hreq->headers[0] = asprintf_or_die("Accept: application/x-protobuf");
+  hreq->headers[1] = asprintf_or_die("Client-Token: %s", session->http_clienttoken.value);
+  hreq->headers[2] = asprintf_or_die("Authorization: Bearer %s", session->http_accesstoken.value);
+
+  free(track_id);
+  return 0;
+}
+
+static int
+msg_make_media_get(struct sp_message *msg, struct sp_session *session)
+{
+  struct http_request *hreq = &msg->payload.hreq;
+  struct sp_channel *channel = session->now_streaming_channel;
+  size_t bytes_from;
+  size_t bytes_to;
+
+  bytes_from = channel->file.offset_bytes;
+
+  if (!channel->file.len_bytes || channel->file.len_bytes > channel->file.offset_bytes + SP_CHUNK_LEN)
+    bytes_to = channel->file.offset_bytes + SP_CHUNK_LEN - 1;
+  else
+    bytes_to = channel->file.len_bytes - 1;
+
+  hreq->url = strdup(channel->file.cdnurl[0]);
+
+  hreq->headers[0] = asprintf_or_die("Range: bytes=%zu-%zu", bytes_from, bytes_to);
+
+//  sp_cb.logmsg("Asking for %s\n", hreq->headers[0]);
+
+  return 0;
+}
+
+// Must be large enough to also include null terminating elements
+static struct sp_seq_request seq_requests[][7] =
+{
+  {
+    // Just a dummy so that the array is aligned with the enum
+    { SP_SEQ_STOP },
+  },
+  {
+    // Resolve will be skipped if already done and servers haven't failed on us
+    { SP_SEQ_LOGIN, "AP_RESOLVE", SP_PROTO_HTTP, msg_make_ap_resolve, NULL, handle_ap_resolve, },
+    { SP_SEQ_LOGIN, "CLIENT_HELLO", SP_PROTO_TCP, msg_make_client_hello, prepare_tcp_handshake, handle_client_hello, },
+    { SP_SEQ_LOGIN, "CLIENT_RESPONSE_PLAINTEXT", SP_PROTO_TCP, msg_make_client_response_plaintext, prepare_tcp_handshake, NULL, },
+    { SP_SEQ_LOGIN, "CLIENT_RESPONSE_ENCRYPTED", SP_PROTO_TCP,  msg_make_client_response_encrypted, prepare_tcp_handshake, handle_tcp_generic, },
+  },
+  {
+    // The first two will be skipped if valid tokens already exist
+    { SP_SEQ_MEDIA_OPEN, "CLIENTTOKEN", SP_PROTO_HTTP, msg_make_clienttoken, NULL, handle_clienttoken, },
+    { SP_SEQ_MEDIA_OPEN, "LOGIN5", SP_PROTO_HTTP, msg_make_login5, NULL, handle_login5, },
+    { SP_SEQ_MEDIA_OPEN, "LOGIN5_CHALLENGES", SP_PROTO_HTTP, msg_make_login5_challenges, NULL, handle_login5, },
+    { SP_SEQ_MEDIA_OPEN, "METADATA_GET", SP_PROTO_HTTP, msg_make_metadata_get, NULL, handle_metadata_get, },
+    { SP_SEQ_MEDIA_OPEN, "AUDIO_KEY_GET", SP_PROTO_TCP, msg_make_audio_key_get, prepare_tcp, handle_tcp_generic, },
+    { SP_SEQ_MEDIA_OPEN, "STORAGE_RESOLVE", SP_PROTO_HTTP, msg_make_storage_resolve, NULL, handle_storage_resolve, },
+    { SP_SEQ_MEDIA_OPEN, "MEDIA_PREFETCH", SP_PROTO_HTTP, msg_make_media_get, NULL, handle_media_get, },
+  },
+  {
+    { SP_SEQ_MEDIA_GET, "MEDIA_GET", SP_PROTO_HTTP, msg_make_media_get, NULL, handle_media_get, },
+  },
+  {
+    { SP_SEQ_PONG, "PONG", SP_PROTO_TCP, msg_make_pong, prepare_tcp, NULL, },
+  },
+};
+
+// Must be large enough to also include null terminating elements
+static struct sp_seq_request seq_requests_legacy[][7] =
+{
+  {
+    // Just a dummy so that the array is aligned with the enum
+    { SP_SEQ_STOP },
+  },
+  {
+    { SP_SEQ_LOGIN, "AP_RESOLVE", SP_PROTO_HTTP, msg_make_ap_resolve, NULL, handle_ap_resolve, },
+    { SP_SEQ_LOGIN, "CLIENT_HELLO", SP_PROTO_TCP, msg_make_client_hello, prepare_tcp_handshake, handle_client_hello, },
+    { SP_SEQ_LOGIN, "CLIENT_RESPONSE_PLAINTEXT", SP_PROTO_TCP, msg_make_client_response_plaintext, prepare_tcp_handshake, NULL, },
+    { SP_SEQ_LOGIN, "CLIENT_RESPONSE_ENCRYPTED", SP_PROTO_TCP,  msg_make_client_response_encrypted, prepare_tcp_handshake, handle_tcp_generic, },
+  },
+  {
+    { SP_SEQ_MEDIA_OPEN, "MERCURY_METADATA_GET", SP_PROTO_TCP, msg_make_mercury_metadata_get, prepare_tcp, handle_tcp_generic, },
+    { SP_SEQ_MEDIA_OPEN, "AUDIO_KEY_GET", SP_PROTO_TCP, msg_make_audio_key_get, prepare_tcp, handle_tcp_generic, },
+    { SP_SEQ_MEDIA_OPEN, "CHUNK_PREFETCH", SP_PROTO_TCP, msg_make_chunk_request, prepare_tcp, handle_tcp_generic, },
+  },
+  {
+    { SP_SEQ_MEDIA_GET, "CHUNK_REQUEST", SP_PROTO_TCP, msg_make_chunk_request, prepare_tcp, handle_tcp_generic, },
+  },
+  {
+    { SP_SEQ_PONG, "PONG", SP_PROTO_TCP, msg_make_pong, prepare_tcp, NULL, },
+  },
+};
+
+int
+seq_requests_check(void)
+{
+  for (int i = 0; i < ARRAY_SIZE(seq_requests); i++)
+    {
+      if (i != seq_requests[i]->seq_type)
+	return -1;
+    }
+  for (int i = 0; i < ARRAY_SIZE(seq_requests_legacy); i++)
+    {
+      if (i != seq_requests_legacy[i]->seq_type)
+	return -1;
+    }
+
+  return 0;
+}
+
+struct sp_seq_request *
+seq_request_get(enum sp_seq_type seq_type, int n, bool use_legacy)
+{
+  if (use_legacy)
+    return &seq_requests_legacy[seq_type][n];
+
+  return &seq_requests[seq_type][n];
+}
+
+// This is just a wrapper to help debug if we are unintentionally overwriting
+// a queued sequence
+void
+seq_next_set(struct sp_session *session, enum sp_seq_type seq_type)
+{
+  bool will_overwrite = (seq_type != SP_SEQ_STOP && session->next_seq != SP_SEQ_STOP && seq_type != session->next_seq);
+
+  if (will_overwrite)
+    sp_cb.logmsg("Bug! Sequence is being overwritten (prev %d, new %d)", session->next_seq, seq_type);
+
+  assert(!will_overwrite);
+
+  session->next_seq = seq_type;
+}
+
+enum sp_error
+seq_request_prepare(struct sp_seq_request *request, struct sp_conn_callbacks *cb, struct sp_session *session)
+{
+  if (!request->request_prepare)
+    return SP_OK_DONE;
+
+  return request->request_prepare(request, cb, session);
+}
+
+void
+msg_clear(struct sp_message *msg)
+{
+  if (!msg)
+    return;
+
+  if (msg->type == SP_MSG_TYPE_HTTP_REQ)
+    http_request_free(&msg->payload.hreq, true);
+  else if (msg->type == SP_MSG_TYPE_HTTP_RES)
+    http_response_free(&msg->payload.hres, true);
+  else if (msg->type == SP_MSG_TYPE_TCP)
+    free(msg->payload.tmsg.data);
+
+  memset(msg, 0, sizeof(struct sp_message));
 }
 
 int
-msg_send(struct sp_message *msg, struct sp_connection *conn)
+msg_make(struct sp_message *msg, struct sp_seq_request *req, struct sp_session *session)
+{
+  memset(msg, 0, sizeof(struct sp_message));
+
+  msg->type = (req->proto == SP_PROTO_HTTP) ? SP_MSG_TYPE_HTTP_REQ : SP_MSG_TYPE_TCP;
+
+  return req->payload_make(msg, session);
+}
+
+enum sp_error
+msg_tcp_send(struct sp_tcp_message *tmsg, struct sp_connection *conn)
 {
   uint8_t pkt[4096];
   ssize_t pkt_len;
   int ret;
 
   if (conn->is_encrypted)
-    pkt_len = packet_make_encrypted(pkt, sizeof(pkt), msg->cmd, msg->data, msg->len, &conn->encrypt);
+    pkt_len = packet_make_encrypted(pkt, sizeof(pkt), tmsg->cmd, tmsg->data, tmsg->len, &conn->encrypt);
   else
-    pkt_len = packet_make_plain(pkt, sizeof(pkt), msg->data, msg->len, msg->add_version_header);
+    pkt_len = packet_make_plain(pkt, sizeof(pkt), tmsg->data, tmsg->len, tmsg->add_version_header);
 
   if (pkt_len < 0)
     RETURN_ERROR(SP_ERR_INVALID, "Error constructing packet to Spotify");
@@ -1394,13 +2207,13 @@ msg_send(struct sp_message *msg, struct sp_connection *conn)
   if (ret != pkt_len)
     RETURN_ERROR(SP_ERR_NOCONNECTION, "Error sending packet to Spotify");
 
-//  sp_cb.logmsg("Sent pkt type %d (cmd=0x%02x) with size %zu (fd=%d)\n", msg->type, msg->cmd, pkt_len, conn->response_fd);
+//  sp_cb.logmsg("Sent pkt type %d (cmd=0x%02x) with size %zu (fd=%d)\n", tmsg->type, tmsg->cmd, pkt_len, conn->response_fd);
 #else
   ret = debug_mock_response(msg, conn);
   if (ret < 0)
     RETURN_ERROR(SP_ERR_NOCONNECTION, "Error mocking send packet to Spotify");
 
-  sp_cb.logmsg("Mocked send/response pkt type %d (cmd=0x%02x) with size %zu\n", msg->type, msg->cmd, pkt_len);
+  sp_cb.logmsg("Mocked send/response pkt type %d (cmd=0x%02x) with size %zu\n", tmsg->type, tmsg->cmd, pkt_len);
 #endif
 
   // Save sent packet for MAC calculation later
@@ -1410,28 +2223,54 @@ msg_send(struct sp_message *msg, struct sp_connection *conn)
   // Reset the disconnect timer
   event_add(conn->idle_ev, &sp_idle_tv);
 
-  return 0;
+  return SP_OK_DONE;
 
  error:
   return ret;
 }
 
-int
-msg_pong(struct sp_session *session)
+enum sp_error
+msg_http_send(struct http_response *hres, struct http_request *hreq, struct http_session *hses)
 {
-  struct sp_message msg;
   int ret;
 
-  ret = msg_make(&msg, MSG_TYPE_PONG, session);
+  hreq->user_agent = sp_sysinfo.client_name;
+
+//  sp_cb.logmsg("Making http request to %s\n", hreq->url);
+
+  ret = http_request(hres, hreq, hses);
+  if (ret < 0)
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "No connection to Spotify for http request");
+
+  return SP_OK_DONE;
+
+ error:
+  return ret;
+}
+
+enum sp_error
+msg_pong(struct sp_session *session)
+{
+  struct sp_seq_request *req;
+  struct sp_message msg = { 0 };
+  int ret;
+
+  req = seq_request_get(SP_SEQ_PONG, 0, session->use_legacy);
+
+  ret = msg_make(&msg, req, session);
   if (ret < 0)
     RETURN_ERROR(SP_ERR_INVALID, "Error constructing pong message to Spotify");
 
-  ret = msg_send(&msg, &session->conn);
+  ret = msg_tcp_send(&msg.payload.tmsg, &session->conn);
   if (ret < 0)
     RETURN_ERROR(ret, sp_errmsg);
 
-  return 0;
+  msg_clear(&msg);
+
+  return SP_OK_DONE;
 
  error:
+  msg_clear(&msg);
+
   return ret;
 }

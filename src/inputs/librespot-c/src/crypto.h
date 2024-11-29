@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <stddef.h>
 #include <gcrypt.h>
+#include <time.h>
 
 #include "shannon/Shannon.h"
 
@@ -31,6 +32,26 @@ struct crypto_keys
 
   uint8_t *shared_secret;
   size_t shared_secret_len;
+};
+
+struct crypto_hashcash_challenge
+{
+  uint8_t *ctx;
+  size_t ctx_len;
+  uint8_t prefix[16];
+
+  // Required number of trailing zero bits in the SHA1 of prefix and suffix.
+  // More bits -> more difficult.
+  int wanted_zero_bits;
+
+  // Give up limit
+  int max_iterations;
+};
+
+struct crypto_hashcash_solution
+{
+  uint8_t suffix[16];
+  struct timespec duration;
 };
 
 
@@ -71,5 +92,8 @@ crypto_aes_decrypt(uint8_t *encrypted, size_t encrypted_len, struct crypto_aes_c
 
 int
 crypto_base62_to_bin(uint8_t *out, size_t out_len, const char *in);
+
+int
+crypto_hashcash_solve(struct crypto_hashcash_solution *solution, struct crypto_hashcash_challenge *challenge, const char **errmsg);
 
 #endif /* __CRYPTO_H__ */
