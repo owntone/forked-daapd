@@ -1247,6 +1247,8 @@ outputs_write(void *buf, size_t bufsize, int nsamples, struct media_quality *qua
 void
 outputs_metadata_send(uint32_t item_id, bool startup, output_metadata_finalize_cb cb)
 {
+  return;
+/*	
   int i;
 
   for (i = 0; outputs[i]; i++)
@@ -1256,6 +1258,7 @@ outputs_metadata_send(uint32_t item_id, bool startup, output_metadata_finalize_c
 
       metadata_send(i, item_id, startup, cb);
     }
+*/
 }
 
 void
