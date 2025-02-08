@@ -340,7 +340,7 @@ net_connect_impl(const char *addr, unsigned short port, int type, const char *lo
   ret = getaddrinfo(addr, strport, &hints, &servinfo);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_MISC, "Could not connect to '%s' at %s (port %u): %s\n", log_service_name, addr, port, gai_strerror(ret));
+      DPRINTF(E_LOG, L_MISC, "Could not get '%s' address info for %s (port %u): %s\n", log_service_name, addr, port, gai_strerror(ret));
       return -1;
     }
 
