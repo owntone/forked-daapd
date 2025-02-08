@@ -565,7 +565,9 @@ prepare_tcp_handshake(struct sp_seq_request *request, struct sp_conn_callbacks *
       ret = ap_connect(&session->conn, &session->accesspoint, &session->cooldown_ts, cb, session);
       if (ret == SP_ERR_NOCONNECTION)
 	{
-	  seq_next_set(session, request->seq_type);
+	  if (request->seq_type != SP_SEQ_LOGIN)
+	    seq_next_set(session, request->seq_type);
+
 	  session->request = seq_request_get(SP_SEQ_LOGIN, 0, session->use_legacy);
 	  return SP_OK_WAIT;
 	}
