@@ -2088,7 +2088,7 @@ spotifywebapi_oauth_callback(struct evkeyvalq *param, const char *redirect_uri, 
   if (ret < 0)
     goto error;
 
-  ret = spotify_login_token(spotify_credentials.user, spotify_credentials.access_token, errmsg);
+  ret = spotify_login(spotify_credentials.user, spotify_credentials.access_token, errmsg);
   if (ret < 0)
     goto error;
 

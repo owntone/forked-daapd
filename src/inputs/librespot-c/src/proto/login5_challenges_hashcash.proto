@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package spotify.login5.v3.challenges;
+
+import "google_duration.proto";
+
+message HashcashChallenge {
+  bytes prefix = 1;
+  int32 length = 2;
+}
+
+message HashcashSolution {
+  bytes suffix = 1;
+  google.protobuf.Duration duration = 2;
+}

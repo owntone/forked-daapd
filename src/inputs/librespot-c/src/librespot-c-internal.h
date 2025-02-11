@@ -27,16 +27,19 @@
 #define be64toh(x) OSSwapBigToHostInt64(x)
 #endif
 
+#define ARRAY_SIZE(x) ((unsigned int)(sizeof(x) / sizeof((x)[0])))
+
 #include "librespot-c.h"
 #include "crypto.h"
+#include "http.h"
 
 #include "proto/keyexchange.pb-c.h"
 #include "proto/authentication.pb-c.h"
 #include "proto/mercury.pb-c.h"
 #include "proto/metadata.pb-c.h"
-
-#define SP_AP_RESOLVE_URL "https://APResolve.spotify.com/"
-#define SP_AP_RESOLVE_KEY "ap_list"
+#include "proto/clienttoken.pb-c.h"
+#include "proto/login5.pb-c.h"
+#include "proto/storage_resolve.pb-c.h"
 
 // Disconnect from AP after this number of secs idle
 #define SP_AP_DISCONNECT_SECS 60
@@ -47,6 +50,9 @@
 // After a disconnect we try to reconnect, but if we are disconnected yet again
 // we get the hint and won't try reconnecting again until after this cooldown
 #define SP_AP_COOLDOWN_SECS 30
+
+// How long after a connection failure we try to avoid an AP
+#define SP_AP_AVOID_SECS 3600
 
 // If client hasn't requested anything in particular
 #define SP_BITRATE_DEFAULT SP_BITRATE_320
@@ -68,14 +74,21 @@
 // Download in chunks of 32768 bytes. The chunks shouldn't be too large because
 // it makes seeking slow (seeking involves jumping around in the file), but
 // large enough that the file can be probed from the first chunk.
-#define SP_CHUNK_LEN_WORDS 1024 * 8
+// For comparison, Spotify for Windows seems to request 7300 byte chunks.
+#define SP_CHUNK_LEN 32768
 
 // Used to create default sysinfo, which should be librespot_[short sha]_[random 8 characters build id],
 // ref https://github.com/plietar/librespot/pull/218. User may override, but
 // as of 20220516 Spotify seems to have whitelisting of client name.
 #define SP_CLIENT_NAME_DEFAULT "librespot"
-#define SP_CLIENT_VERSION_DEFAULT "000000"
+#define SP_CLIENT_VERSION_DEFAULT "0.0.0"
 #define SP_CLIENT_BUILD_ID_DEFAULT "aabbccdd"
+
+// ClientIdHex from client_id.go. This seems to be the id that Spotify's own app
+// uses. It is used in the call to https://clienttoken.spotify.com/v1/clienttoken.
+// The endpoint doesn't accept client ID's of app registered at
+// develop.spotify.com, so unfortunately spoofing is required.
+#define SP_CLIENT_ID_DEFAULT "65b708073fc0480ea92a077233ca87bd"
 
 // Shorthand for error handling
 #define RETURN_ERROR(r, m) \
@@ -100,15 +113,24 @@ enum sp_error
 
 enum sp_msg_type
 {
-  MSG_TYPE_NONE,
-  MSG_TYPE_CLIENT_HELLO,
-  MSG_TYPE_CLIENT_RESPONSE_PLAINTEXT,
-  MSG_TYPE_CLIENT_RESPONSE_ENCRYPTED,
-  MSG_TYPE_PONG,
-  MSG_TYPE_MERCURY_TRACK_GET,
-  MSG_TYPE_MERCURY_EPISODE_GET,
-  MSG_TYPE_AUDIO_KEY_GET,
-  MSG_TYPE_CHUNK_REQUEST,
+  SP_MSG_TYPE_HTTP_REQ,
+  SP_MSG_TYPE_HTTP_RES,
+  SP_MSG_TYPE_TCP,
+};
+
+enum sp_seq_type
+{
+  SP_SEQ_STOP = 0,
+  SP_SEQ_LOGIN,
+  SP_SEQ_MEDIA_OPEN,
+  SP_SEQ_MEDIA_GET,
+  SP_SEQ_PONG,
+};
+
+enum sp_proto
+{
+  SP_PROTO_TCP,
+  SP_PROTO_HTTP,
 };
 
 enum sp_media_type
@@ -177,6 +199,7 @@ struct sp_cmdargs
   int fd_write;
   size_t seek_pos;
   enum sp_bitrates bitrate;
+  int use_legacy;
 
   sp_progress_cb progress_cb;
   void *cb_arg;
@@ -190,31 +213,44 @@ struct sp_conn_callbacks
   event_callback_fn timeout_cb;
 };
 
-struct sp_message
+struct sp_tcp_message
 {
-  enum sp_msg_type type;
   enum sp_cmd_type cmd;
 
   bool encrypt;
   bool add_version_header;
 
-  enum sp_msg_type type_next;
-  enum sp_msg_type type_queued;
+  size_t len;
+  uint8_t *data;
+};
 
-  int (*response_handler)(uint8_t *msg, size_t msg_len, struct sp_session *session);
+struct sp_message
+{
+  enum sp_msg_type type;
 
-  ssize_t len;
-  uint8_t data[4096];
+  union payload
+    {
+      struct sp_tcp_message tmsg;
+      struct http_request hreq;
+      struct http_response hres;
+    } payload;
+};
+
+struct sp_server
+{
+  char address[256]; // e.g. ap-gue1.spotify.com
+  unsigned short port; // normally 433 or 4070
+  time_t last_connect_ts;
+  time_t last_resolved_ts;
+  time_t last_failed_ts;
 };
 
 struct sp_connection
 {
+  struct sp_server *server; // NULL or pointer to session.accesspoint
+
   bool is_connected;
   bool is_encrypted;
-
-  // Resolved access point
-  char *ap_address;
-  unsigned short ap_port;
 
   // Where we receive data from Spotify
   int response_fd;
@@ -235,6 +271,14 @@ struct sp_connection
   struct crypto_keys keys;
   struct crypto_cipher encrypt;
   struct crypto_cipher decrypt;
+};
+
+struct sp_token
+{
+  char value[512]; // base64 string, actual size 360 bytes
+  int32_t expires_after_seconds;
+  int32_t refresh_after_seconds;
+  time_t received_ts;
 };
 
 struct sp_mercury
@@ -263,14 +307,18 @@ struct sp_file
   uint8_t media_id[16]; // Decoded value of the URIs base62
   enum sp_media_type media_type; // track or episode from URI
 
+  // For files that are served via http/"new protocol" (we may receive multiple
+  // urls).
+  char *cdnurl[4];
+
   uint8_t key[16];
 
   uint16_t channel_id;
 
   // Length and download progress
-  size_t len_words; // Length of file in words (32 bit)
-  size_t offset_words;
-  size_t received_words;
+  size_t len_bytes;
+  size_t offset_bytes;
+  size_t received_bytes;
   bool end_of_file;
   bool end_of_chunk;
   bool open;
@@ -326,11 +374,22 @@ struct sp_channel
 // Linked list of sessions
 struct sp_session
 {
+  struct sp_server accesspoint;
+  struct sp_server spclient;
+  struct sp_server dealer;
+
   struct sp_connection conn;
   time_t cooldown_ts;
 
-  // Address of an access point we want to avoid due to previous failure
-  char *ap_avoid;
+  // Use legacy protocol (non http, see seq_requests_legacy)
+  bool use_legacy;
+
+  struct http_session http_session;
+  struct sp_token http_clienttoken;
+  struct sp_token http_accesstoken;
+
+  int n_hashcash_challenges;
+  struct crypto_hashcash_challenge *hashcash_challenges;
 
   bool is_logged_in;
   struct sp_credentials credentials;
@@ -344,23 +403,34 @@ struct sp_session
   // the current track is also available
   struct sp_channel *now_streaming_channel;
 
+  // Current request in the sequence
+  struct sp_seq_request *request;
+
   // Go to next step in a request sequence
   struct event *continue_ev;
 
-  // Current, next and subsequent message being processed
-  enum sp_msg_type msg_type_last;
-  enum sp_msg_type msg_type_next;
-  enum sp_msg_type msg_type_queued;
-  int (*response_handler)(uint8_t *, size_t, struct sp_session *);
+  // Which sequence comes next
+  enum sp_seq_type next_seq;
 
   struct sp_session *next;
 };
 
+struct sp_seq_request
+{
+  enum sp_seq_type seq_type;
+  const char *name; // Name of request (for logging)
+  enum sp_proto proto;
+  int (*payload_make)(struct sp_message *, struct sp_session *);
+  enum sp_error (*request_prepare)(struct sp_seq_request *, struct sp_conn_callbacks *, struct sp_session *);
+  enum sp_error (*response_handler)(struct sp_message *, struct sp_session *);
+};
+
 struct sp_err_map
 {
-  ErrorCode errorcode;
+  int errorcode;
   const char *errmsg;
 };
+
 
 extern struct sp_callbacks sp_cb;
 extern struct sp_sysinfo sp_sysinfo;

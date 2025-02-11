@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package spotify.login5.v3;
+
+message ClientInfo {
+  string client_id = 1;
+  string device_id = 2;
+}
