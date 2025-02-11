@@ -340,9 +340,6 @@ ap_connect(struct sp_connection *conn, struct sp_server *server, time_t *cooldow
   int ret;
   time_t now;
 
-  if (must_resolve(server))
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Cannot connect to access point, it has recently failed");
-
   // Protection against flooding the access points with reconnection attempts
   // Note that cooldown_ts can't be part of the connection struct because
   // the struct is reset between connection attempts.
@@ -352,20 +349,33 @@ ap_connect(struct sp_connection *conn, struct sp_server *server, time_t *cooldow
   else if (now >= *cooldown_ts) // Last attempt was recent, so disallow more attempts for a while
     *cooldown_ts = now + SP_AP_COOLDOWN_SECS;
   else
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Cannot connect to access point, cooldown after disconnect is in effect");
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Cannot connect to access points, cooldown after multiple disconnects");
+
+  // This server has recently failed, so tell caller to try another
+  if (must_resolve(server))
+    {
+      sp_cb.logmsg("Server '%s' no longer valid\n", server->address);
+      goto retry;
+    }
 
   if (conn->is_connected)
     ap_disconnect(conn);
 
   ret = tcp_connection_make(conn, server, cb, cb_arg);
   if (ret < 0)
-    RETURN_ERROR(ret, sp_errmsg);
+    {
+      sp_cb.logmsg("Couldn't connect to '%s': %s\n", server->address, sp_errmsg);
+      goto retry;
+    }
 
   return SP_OK_DONE;
 
  error:
   ap_disconnect(conn);
   return ret;
+
+ retry:
+  return SP_OK_WAIT; // Tells caller to try another
 }
 
 void
@@ -563,7 +573,7 @@ prepare_tcp_handshake(struct sp_seq_request *request, struct sp_conn_callbacks *
   if (!session->conn.is_connected)
     {
       ret = ap_connect(&session->conn, &session->accesspoint, &session->cooldown_ts, cb, session);
-      if (ret == SP_ERR_NOCONNECTION)
+      if (ret == SP_OK_WAIT) // Try another server
 	{
 	  if (request->seq_type != SP_SEQ_LOGIN)
 	    seq_next_set(session, request->seq_type);
@@ -639,7 +649,7 @@ resolve_server_info_set(struct sp_server *server, const char *key, json_object *
     }
 
   if (!s)
-    RETURN_ERROR(SP_ERR_NOCONNECTION, "Response from access port resolver had no valid servers");
+    RETURN_ERROR(SP_ERR_NOCONNECTION, "Response from resolver had no valid servers");
 
   if (!is_same)
     {
@@ -1140,7 +1150,7 @@ handle_media_get(struct sp_message *msg, struct sp_session *session)
   if (channel->file.len_bytes == 0 && file_size_get(channel, hres) < 0)
     RETURN_ERROR(SP_ERR_INVALID, "Invalid content-range, can't determine media size");
 
-  sp_cb.logmsg("Received %zu bytes, size is %d\n", hres->body_len, channel->file.len_bytes);
+//  sp_cb.logmsg("Received %zu bytes, size is %d\n", hres->body_len, channel->file.len_bytes);
 
   // Not sure if the channel concept even makes sense for http, but nonetheless
   // we use it to stay consistent with the old tcp protocol
