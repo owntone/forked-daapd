@@ -32,6 +32,7 @@ enum sort_type {
   S_POS,
   S_SHUFFLE_POS,
   S_DATE_RELEASED,
+  S_MD_VALUE,
 };
 
 #define Q_F_BROWSE (1 << 15)
@@ -46,6 +47,7 @@ enum query_type {
   Q_GROUP_ITEMS      = 7,
   Q_GROUP_DIRS       = 8,
   Q_COUNT_ITEMS      = 9,
+  Q_FILE_METADATA    = 10,
 
   // Keep in sync with browse_clause[]
   Q_BROWSE_ARTISTS   = Q_F_BROWSE | 1,
@@ -57,6 +59,8 @@ enum query_type {
   Q_BROWSE_TRACKS    = Q_F_BROWSE | 7,
   Q_BROWSE_VPATH     = Q_F_BROWSE | 8,
   Q_BROWSE_PATH      = Q_F_BROWSE | 9,
+  Q_BROWSE_GENRES_MD = Q_F_BROWSE | 10,
+  Q_BROWSE_COMPOSERS_MD = Q_F_BROWSE | 11,
 };
 
 #define ARTWORK_UNKNOWN   0
@@ -93,6 +97,7 @@ struct query_params {
   char *having;
   char *order;
   char *group;
+  char *join;
 
   char *filter;
 
@@ -253,6 +258,47 @@ struct media_file_info {
 };
 
 #define mfi_offsetof(field) offsetof(struct media_file_info, field)
+
+/* Keep in sync with metadata_infos */
+enum metadata_kind {
+  MD_LYRICS = 0,
+  MD_GENRE = 1,
+  MD_MUSICBRAINZ_ALBUMID = 2,
+  MD_MUSICBRAINZ_ARTISTID = 3,
+  MD_MUSICBRAINZ_ALBUMARTISTID = 4,
+  MD_COMPOSER = 5,
+};
+
+struct metadata_kind_info {
+  char *label;
+  int is_list;
+};
+
+const struct metadata_kind_info *
+db_metadata_kind_info_get(enum metadata_kind metadata_kind);
+
+struct media_file_metadata_info {
+  uint32_t file_id;
+  int64_t songalbumid;
+  int64_t songartistid;
+  uint32_t idx;
+  enum metadata_kind metadata_kind;
+  char *value;
+  struct media_file_metadata_info *next;
+};
+
+#define mfmi_offsetof(field) offsetof(struct media_file_metadata_info, field)
+
+struct db_media_file_metadata_info {
+  char *file_id;
+  char *songalbumid;
+  char *songartistid;
+  char *idx;
+  char *metadata_kind;
+  char *value;
+};
+
+#define dbmfmi_offsetof(field) offsetof(struct db_media_file_metadata_info, field)
 
 /* Keep in sync with pl_type_label[] */
 /* PL_SPECIAL value must be in sync with type value in Q_PL* in db_init.c */
@@ -590,6 +636,12 @@ void
 free_mfi(struct media_file_info *mfi, int content_only);
 
 void
+free_mfmi(struct media_file_metadata_info *mfmi, int content_only);
+
+void
+free_mfmi_list(struct media_file_metadata_info **mfmi, int content_only);
+
+void
 free_pli(struct playlist_info *pli, int content_only);
 
 void
@@ -636,6 +688,9 @@ db_query_end(struct query_params *qp);
 
 int
 db_query_fetch_file(struct db_media_file_info *dbmfi, struct query_params *qp);
+
+int
+db_query_fetch_file_metadata(struct db_media_file_metadata_info *dbmfmi, struct query_params *qp);
 
 int
 db_query_fetch_pl(struct db_playlist_info *dbpli, struct query_params *qp);
@@ -973,6 +1028,15 @@ db_queue_get_count(uint32_t *nitems);
 
 int
 db_queue_get_pos(uint32_t item_id, char shuffle);
+
+/* Files extra metadata */
+
+int
+db_file_metadata_add(int file_id, int64_t songalbumid, int64_t songartistid, struct media_file_metadata_info *mfmi);
+int
+db_file_metadata_add_all(int file_id, int64_t songalbumid, int64_t songartistid, struct media_file_metadata_info *mfmi);
+void
+db_file_metadata_clear(int file_id);
 
 /* Inotify */
 int

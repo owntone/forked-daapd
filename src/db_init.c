@@ -208,6 +208,16 @@
   "   channels            INTEGER DEFAULT 0"				\
   ");"
 
+#define T_FILES_METADATA						\
+  "CREATE TABLE IF NOT EXISTS files_metadata ("				\
+  "   file_id            INTEGER NOT NULL,"				\
+  "   songalbumid        INTEGER NOT NULL,"				\
+  "   songartistid       INTEGER NOT NULL,"				\
+  "   metadata_kind      INTEGER NOT NULL,"				\
+  "   idx                INTEGER DEFAULT 0,"				\
+  "   value              TEXT NOT NULL COLLATE DAAP"			\
+  ");"
+
 #define Q_PL1								\
   "INSERT INTO playlists (id, title, type, query, db_timestamp, path, idx, special_id)" \
   " VALUES(1, 'Library', 0, '1 = 1', 0, '', 0, 0);"
@@ -277,6 +287,7 @@ static const struct db_init_query db_init_table_queries[] =
     { T_INOTIFY,   "create table inotify" },
     { T_DIRECTORIES, "create table directories" },
     { T_QUEUE,     "create table queue" },
+    { T_FILES_METADATA, "create table files_metadata" },
 
     { Q_PL1,       "create default playlist" },
     { Q_PL2,       "create default smart playlist 'Music'" },
@@ -378,6 +389,15 @@ static const struct db_init_query db_init_table_queries[] =
 #define I_QUEUE_SHUFFLEPOS				\
   "CREATE INDEX IF NOT EXISTS idx_queue_shufflepos ON queue(shuffle_pos);"
 
+#define I_MD_FILEID_TYPE_IDX				\
+  "CREATE INDEX IF NOT EXISTS idx_filesmd_fileid_type_idx ON files_metadata(file_id, metadata_kind, idx);"
+
+#define I_MD_ALBUMPERSID_TYPE_IDX				\
+  "CREATE INDEX IF NOT EXISTS idx_filesmd_albumid_type_idx ON files_metadata(songalbumid, metadata_kind, idx);"
+
+#define I_MD_ARTISTPERSID_TYPE_IDX				\
+  "CREATE INDEX IF NOT EXISTS idx_filesmd_artistid_type_idx ON files_metadata(songartistid, metadata_kind, idx);"
+
 static const struct db_init_query db_init_index_queries[] =
   {
     { I_RESCAN,    "create rescan index" },
@@ -412,6 +432,8 @@ static const struct db_init_query db_init_index_queries[] =
 
     { I_QUEUE_POS,  "create queue pos index" },
     { I_QUEUE_SHUFFLEPOS,  "create queue shuffle pos index" },
+
+    { I_MD_FILEID_TYPE_IDX,  "create files_metadata file_id type idx index" },
   };
 
 

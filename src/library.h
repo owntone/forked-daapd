@@ -138,7 +138,7 @@ struct library_source
  * @return    0 if operation succeeded, -1 on failure.
  */
 int
-library_media_save(struct media_file_info *mfi);
+library_media_save(struct media_file_info *mfi, struct media_file_metadata_info *mfmi);
 
 /*
  * Adds a playlist if pli->id == 0, otherwise updates.

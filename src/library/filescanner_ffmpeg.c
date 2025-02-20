@@ -62,6 +62,13 @@ struct metadata_map {
   int flags;
 };
 
+struct files_metadata_map {
+  char *key;
+  enum metadata_kind metadata_kind;
+  int (*handler_function)(struct media_file_metadata_info **, const char *);
+  int flags;
+};
+
 // Used for passing errors to DPRINTF (can't count on av_err2str being present)
 static char errbuf[64];
 
@@ -323,6 +330,56 @@ static const struct metadata_map md_map_id3[] =
     { NULL,                  0, 0,                                   NULL }
   };
 
+
+static int
+parse_list(struct media_file_metadata_info **mfmi, enum metadata_kind md_kind, const char *val, const char *delim)
+{
+  char *str;
+  char *token;
+  char *ptr;
+  int idx = 0;
+
+  str = strdup(val);
+
+  token = strtok_r(str, delim, &ptr);
+  for (token = strtok_r(str, delim, &ptr); token; token = strtok_r(NULL, delim, &ptr))
+    {
+      struct media_file_metadata_info *mfmi_new;
+      mfmi_new = calloc(1, sizeof(struct media_file_metadata_info));
+      mfmi_new->metadata_kind = md_kind;
+      mfmi_new->value = strdup(token);
+      mfmi_new->idx = idx++;
+      mfmi_new->next = *mfmi;
+      *mfmi = mfmi_new;
+    }
+
+  free(str);
+  return idx;
+}
+
+static int
+parse_genre_list(struct media_file_metadata_info **mfmi, const char *val)
+{
+  return parse_list(mfmi, MD_GENRE, val, ";/,");
+}
+
+static int
+parse_composer_list(struct media_file_metadata_info **mfmi, const char *val)
+{
+  return parse_list(mfmi, MD_COMPOSER, val, ";/,");
+}
+
+struct files_metadata_map files_md_map[] =
+  {
+    { "genre",                        MD_GENRE,                      parse_genre_list,    0 },
+    { "composer",                     MD_COMPOSER,                   parse_composer_list, 0 },
+    { "lyrics",                       MD_LYRICS,                     NULL,                AV_DICT_IGNORE_SUFFIX },
+    { "MusicBrainz Album Id",         MD_MUSICBRAINZ_ALBUMID,        NULL,                0 },
+    { "MusicBrainz Artist Id",        MD_MUSICBRAINZ_ARTISTID,       NULL,                0 },
+    { "MusicBrainz Album Artist Id",  MD_MUSICBRAINZ_ALBUMARTISTID,  NULL,                0 },
+    { NULL,                           0,                             NULL,                0 }
+  };
+
 static int
 extract_metadata_from_dict(struct media_file_info *mfi, AVDictionary *md, const struct metadata_map *md_map)
 {
@@ -379,7 +436,42 @@ extract_metadata_from_dict(struct media_file_info *mfi, AVDictionary *md, const 
 }
 
 static int
-extract_metadata(struct media_file_info *mfi, AVFormatContext *ctx, AVStream *audio_stream, AVStream *video_stream, const struct metadata_map *md_map)
+extract_extra_metadata_from_dict(struct media_file_metadata_info **mfmi, AVDictionary *md, const struct files_metadata_map *md_map)
+{
+  AVDictionaryEntry *mdt;
+  char *strval;
+  struct media_file_metadata_info *mfmi_new;
+  int mdcount = 0;
+  int i;
+
+  for (i = 0; md_map[i].key != NULL; i++)
+    {
+      mdt = av_dict_get(md, md_map[i].key, NULL, md_map[i].flags);
+      if (!mdt || !mdt->value || strlen(mdt->value) == 0)
+	continue;
+
+      if (md_map[i].handler_function)
+	{
+	  mdcount += md_map[i].handler_function(mfmi, mdt->value);
+	  continue;
+	}
+      else
+        {
+	  strval = strdup(mdt->value);
+	  mfmi_new = calloc(1, sizeof(struct media_file_metadata_info));
+	  mfmi_new->metadata_kind = md_map[i].metadata_kind;
+	  mfmi_new->value = strval;
+	  mfmi_new->next = *mfmi;
+	  *mfmi = mfmi_new;
+	  mdcount++;
+        }
+    }
+
+  return mdcount;
+}
+
+static int
+extract_metadata(struct media_file_info *mfi, struct media_file_metadata_info **mfmi, AVFormatContext *ctx, AVStream *audio_stream, AVStream *video_stream, const struct metadata_map *md_map)
 {
   int mdcount = 0;
   int ret;
@@ -387,6 +479,8 @@ extract_metadata(struct media_file_info *mfi, AVFormatContext *ctx, AVStream *au
   if (ctx->metadata)
     {
       ret = extract_metadata_from_dict(mfi, ctx->metadata, md_map);
+      if (mfmi)
+	ret += extract_extra_metadata_from_dict(mfmi, ctx->metadata, files_md_map);
       mdcount += ret;
 
       DPRINTF(E_DBG, L_SCAN, "Picked up %d tags from file metadata\n", ret);
@@ -395,6 +489,8 @@ extract_metadata(struct media_file_info *mfi, AVFormatContext *ctx, AVStream *au
   if (audio_stream->metadata)
     {
       ret = extract_metadata_from_dict(mfi, audio_stream->metadata, md_map);
+      if (mfmi)
+	ret += extract_extra_metadata_from_dict(mfmi, audio_stream->metadata, files_md_map);
       mdcount += ret;
 
       DPRINTF(E_DBG, L_SCAN, "Picked up %d tags from audio stream metadata\n", ret);
@@ -403,6 +499,8 @@ extract_metadata(struct media_file_info *mfi, AVFormatContext *ctx, AVStream *au
   if (video_stream && video_stream->metadata)
     {
       ret = extract_metadata_from_dict(mfi, video_stream->metadata, md_map);
+      if (mfmi)
+	ret += extract_extra_metadata_from_dict(mfmi, video_stream->metadata, files_md_map);
       mdcount += ret;
 
       DPRINTF(E_DBG, L_SCAN, "Picked up %d tags from video stream metadata\n", ret);
@@ -422,7 +520,7 @@ extract_metadata(struct media_file_info *mfi, AVFormatContext *ctx, AVStream *au
  * - fname: (filename) used as fallback for artist
  */
 int
-scan_metadata_ffmpeg(struct media_file_info *mfi, const char *file)
+scan_metadata_ffmpeg(struct media_file_info *mfi, struct media_file_metadata_info **mfmi, const char *file)
 {
   AVFormatContext *ctx;
   AVDictionary *options;
@@ -765,13 +863,13 @@ scan_metadata_ffmpeg(struct media_file_info *mfi, const char *file)
 
   if (extra_md_map)
     {
-      ret = extract_metadata(mfi, ctx, audio_stream, video_stream, extra_md_map);
+      ret = extract_metadata(mfi, NULL, ctx, audio_stream, video_stream, extra_md_map);
       mdcount += ret;
 
       DPRINTF(E_DBG, L_SCAN, "Picked up %d tags with extra md_map\n", ret);
     }
 
-  ret = extract_metadata(mfi, ctx, audio_stream, video_stream, md_map_generic);
+  ret = extract_metadata(mfi, mfmi, ctx, audio_stream, video_stream, md_map_generic);
   mdcount += ret;
 
   DPRINTF(E_DBG, L_SCAN, "Picked up %d tags with generic md_map, %d tags total\n", ret, mdcount);

@@ -569,6 +569,7 @@ process_regular_file(const char *file, struct stat *sb, int type, int flags, int
 {
   bool is_bulkscan = (flags & F_SCAN_BULK);
   struct media_file_info mfi;
+  struct media_file_metadata_info *mfmi = NULL;
   char virtual_path[PATH_MAX];
   int ret;
 
@@ -625,20 +626,22 @@ process_regular_file(const char *file, struct stat *sb, int type, int flags, int
 	  mfi.album_artist = safe_strdup(cfg_getstr(cfg_getsec(cfg, "library"), "compilation_artist"));
 	}
 
-      ret = scan_metadata_ffmpeg(&mfi, file);
+      ret = scan_metadata_ffmpeg(&mfi, &mfmi, file);
       if (ret < 0)
 	{
 	  free_mfi(&mfi, 1);
+          free_mfmi_list(&mfmi, 0);
 	  return;
 	}
     }
 
-  library_media_save(&mfi);
+  library_media_save(&mfi, mfmi);
 
   cache_artwork_ping(file, sb->st_mtime, !is_bulkscan);
   // TODO [artworkcache] If entry in artwork cache exists for no artwork available, delete the entry if media file has embedded artwork
 
   free_mfi(&mfi, 1);
+  free_mfmi_list(&mfmi, 0);
 }
 
 /* Thread: scan */
@@ -2001,7 +2004,7 @@ playlist_add_files(FILE *fp, int pl_id, const char *virtual_path)
 
       memset(&mfi, 0, sizeof(struct media_file_info));
       scan_metadata_stream(&mfi, path);
-      library_media_save(&mfi);
+      library_media_save(&mfi, NULL);
       free_mfi(&mfi, 1);
 
       ret = playlist_add_path(fp, pl_id, path);
@@ -2159,7 +2162,7 @@ queue_save(const char *virtual_path)
 
 	      memset(&mfi, 0, sizeof(struct media_file_info));
 	      scan_metadata_stream(&mfi, queue_item.path);
-	      library_media_save(&mfi);
+	      library_media_save(&mfi, NULL);
 	      free_mfi(&mfi, 1);
 	    }
 	  else

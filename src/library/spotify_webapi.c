@@ -1589,7 +1589,7 @@ track_add(struct spotify_track *track, struct spotify_album *album, const char *
 
       map_track_to_mfi(&mfi, track, album, pl_name);
 
-      library_media_save(&mfi);
+      library_media_save(&mfi, NULL);
 
       free_mfi(&mfi, 1);
     }

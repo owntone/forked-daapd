@@ -3429,6 +3429,83 @@ jsonapi_reply_library_tracks_put_byid(struct httpd_request *hreq)
 }
 
 static int
+jsonapi_reply_library_track_metadata(struct httpd_request *hreq)
+{
+  const char *track_id;
+  struct query_params query_params = { 0 };
+  struct db_media_file_metadata_info dbmfmi = { 0 };
+  json_object *reply;
+  json_object *list;
+  int id;
+  int intval;
+  const struct metadata_kind_info *metadata_kind_info;
+  int ret = 0;
+
+  if (!is_modified(hreq, DB_ADMIN_DB_UPDATE))
+    return HTTP_NOTMODIFIED;
+
+  track_id = hreq->path_parts[3];
+  if (safe_atoi32(track_id, &id) < 0)
+    {
+      DPRINTF(E_LOG, L_WEB, "Error converting track id '%s' to int.\n", track_id);
+      return HTTP_INTERNAL;
+    }
+
+  reply = json_object_new_object();
+
+  query_params.type = Q_FILE_METADATA;
+  query_params.id = id;
+  ret = db_query_start(&query_params);
+  if (ret < 0)
+    goto error;
+
+  while (((ret = db_query_fetch_file_metadata(&dbmfmi, &query_params)) == 0) && (dbmfmi.file_id))
+    {
+      ret = safe_atoi32(dbmfmi.metadata_kind, &intval);
+      if (ret == 0)
+        {
+          metadata_kind_info = db_metadata_kind_info_get(intval);
+          if (metadata_kind_info)
+            {
+              if (metadata_kind_info->is_list)
+                {
+                  list = json_object_object_get(reply, metadata_kind_info->label);
+                  if (!list)
+                    {
+                      list = json_object_new_array();
+                      json_object_object_add(reply, metadata_kind_info->label, list);
+                    }
+                  json_object_array_add(list, json_object_new_string(dbmfmi.value));
+                }
+              else
+                {
+                  json_object_object_add(reply, metadata_kind_info->label, json_object_new_string(dbmfmi.value));
+                }
+            }
+          else
+            DPRINTF(E_LOG, L_WEB, "Error converting metadata kind '%s' to label.\n", dbmfmi.metadata_kind);
+        }
+       else
+        {
+          DPRINTF(E_LOG, L_WEB, "Error converting metadata kind '%s' to int.\n", dbmfmi.metadata_kind);
+        }
+    }
+
+  ret = evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply));
+  if (ret < 0)
+    DPRINTF(E_LOG, L_WEB, "browse: Couldn't add track metadata to response buffer.\n");
+
+ error:
+  db_query_end(&query_params);
+  jparse_free(reply);
+
+  if (ret < 0)
+    return HTTP_INTERNAL;
+
+  return HTTP_OK;
+}
+
+static int
 jsonapi_reply_library_track_playlists(struct httpd_request *hreq)
 {
   struct query_params query_params;
@@ -3902,8 +3979,8 @@ jsonapi_reply_library_browse(struct httpd_request *hreq)
     }
   else if (strcmp(browse_type, "composers") == 0)
     {
-      query_params.type = Q_BROWSE_COMPOSERS;
-      query_params.sort = S_COMPOSER;
+      query_params.type = Q_BROWSE_COMPOSERS_MD;
+      query_params.sort = S_MD_VALUE;
       query_params.idx_type = I_NONE;
     }
   else
@@ -3965,16 +4042,16 @@ jsonapi_reply_library_browseitem(struct httpd_request *hreq)
   if (strcmp(browse_type, "genres") == 0)
     {
       query_params.type = Q_BROWSE_GENRES;
-      query_params.sort = S_GENRE;
+      query_params.sort = S_MD_VALUE;
       query_params.idx_type = I_NONE;
-      query_params.filter = db_mprintf("(f.genre = %Q)", item_name);
+      query_params.filter = db_mprintf("(m.value = %Q)", item_name);
     }
   else if (strcmp(browse_type, "composers") == 0)
     {
-      query_params.type = Q_BROWSE_COMPOSERS;
-      query_params.sort = S_COMPOSER;
+      query_params.type = Q_BROWSE_COMPOSERS_MD;
+      query_params.sort = S_MD_VALUE;
       query_params.idx_type = I_NONE;
-      query_params.filter = db_mprintf("(f.composer = %Q)", item_name);
+      query_params.filter = db_mprintf("(m.value = %Q)", item_name);
     }
   else
     {
@@ -4004,6 +4081,77 @@ jsonapi_reply_library_browseitem(struct httpd_request *hreq)
   db_query_end(&query_params);
   jparse_free(reply);
   free_query_params(&query_params, 1);
+
+  if (ret < 0)
+    return HTTP_INTERNAL;
+
+  return HTTP_OK;
+}
+
+static int
+jsonapi_reply_library_browse_albums(struct httpd_request *hreq)
+{
+  struct query_params query_params;
+  const char *browse_type;
+  const char *item_name;
+  json_object *reply;
+  json_object *items;
+  int total;
+  int ret = 0;
+
+  if (!is_modified(hreq, DB_ADMIN_DB_UPDATE))
+    return HTTP_NOTMODIFIED;
+
+  browse_type = hreq->path_parts[2];
+  item_name = hreq->path_parts[3];
+  DPRINTF(E_DBG, L_WEB, "Albums browse item query with type '%s' and item '%s'\n", browse_type, item_name);
+
+  reply = json_object_new_object();
+  items = json_object_new_array();
+  json_object_object_add(reply, "items", items);
+
+  memset(&query_params, 0, sizeof(struct query_params));
+
+  ret = query_params_limit_set(&query_params, hreq);
+  if (ret < 0)
+    goto error;
+
+  query_params.type = Q_GROUP_ALBUMS;
+  query_params.sort = S_ALBUM;
+
+  if (strcmp(browse_type, "genres") == 0)
+    {
+      query_params.join = db_mprintf("JOIN files_metadata m ON f.id = m.file_id AND m.metadata_kind = %d", MD_GENRE);
+      query_params.filter = db_mprintf("(m.value = %Q)", item_name);
+    }
+  else if (strcmp(browse_type, "composers") == 0)
+    {
+      query_params.join = db_mprintf("JOIN files_metadata m ON f.id = m.file_id AND m.metadata_kind = %d", MD_COMPOSER);
+      query_params.filter = db_mprintf("(m.value = %Q)", item_name);
+    }
+  else
+    {
+      DPRINTF(E_LOG, L_WEB, "Invalid browse type '%s'\n", browse_type);
+      goto error;
+    }
+
+  ret = fetch_albums(&query_params, items, &total);
+  free(query_params.filter);
+  free(query_params.join);
+
+  if (ret < 0)
+    goto error;
+
+  json_object_object_add(reply, "total", json_object_new_int(total));
+  json_object_object_add(reply, "offset", json_object_new_int(query_params.offset));
+  json_object_object_add(reply, "limit", json_object_new_int(query_params.limit));
+
+  ret = evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply));
+  if (ret < 0)
+    DPRINTF(E_LOG, L_WEB, "browse: Couldn't add albums to response buffer.\n");
+
+ error:
+  jparse_free(reply);
 
   if (ret < 0)
     return HTTP_INTERNAL;
@@ -4729,7 +4877,9 @@ static struct httpd_uri_map adm_handlers[] =
     { HTTPD_METHOD_GET,    "^/api/library/tracks/[[:digit:]]+$",           jsonapi_reply_library_tracks_get_byid },
     { HTTPD_METHOD_PUT,    "^/api/library/tracks/[[:digit:]]+$",           jsonapi_reply_library_tracks_put_byid },
     { HTTPD_METHOD_GET,    "^/api/library/tracks/[[:digit:]]+/playlists$", jsonapi_reply_library_track_playlists },
+    { HTTPD_METHOD_GET,    "^/api/library/tracks/[[:digit:]]+/metadata$",  jsonapi_reply_library_track_metadata },
     { HTTPD_METHOD_GET,    "^/api/library/(genres|composers)$",            jsonapi_reply_library_browse },
+    { HTTPD_METHOD_GET,    "^/api/library/(genres|composers)/.*/albums$",  jsonapi_reply_library_browse_albums },
     { HTTPD_METHOD_GET,    "^/api/library/(genres|composers)/.*$",         jsonapi_reply_library_browseitem },
     { HTTPD_METHOD_GET,    "^/api/library/count$",                         jsonapi_reply_library_count },
     { HTTPD_METHOD_GET,    "^/api/library/files$",                         jsonapi_reply_library_files },

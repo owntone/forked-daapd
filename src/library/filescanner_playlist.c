@@ -163,7 +163,7 @@ scan_metadata_stream(struct media_file_info *mfi, const char *path)
   mfi->directory_id = DIR_HTTP;
   mfi->scan_kind = SCAN_KIND_FILES;
 
-  ret = scan_metadata_ffmpeg(mfi, path);
+  ret = scan_metadata_ffmpeg(mfi, NULL, path);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_SCAN, "Playlist URL '%s' is unavailable for probe/metadata, assuming MP3 encoding\n", path);
@@ -275,7 +275,7 @@ process_url(int pl_id, const char *path, struct media_file_info *mfi)
   else
     scan_metadata_stream(mfi, path);
 
-  ret = library_media_save(mfi);
+  ret = library_media_save(mfi, NULL);
   if (ret < 0)
     return -1;
 

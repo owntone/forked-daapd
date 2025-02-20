@@ -119,6 +119,8 @@ struct db_statements
 
   sqlite3_stmt *queue_items_insert;
   sqlite3_stmt *queue_items_update;
+
+  sqlite3_stmt *files_metadata_insert;
 };
 
 struct col_type_map {
@@ -147,6 +149,7 @@ struct fixup_ctx
 };
 
 struct query_clause {
+  char *join;
   char *where;
   char *group;
   char *having;
@@ -156,6 +159,7 @@ struct query_clause {
 
 struct browse_clause {
   char *select;
+  char *from;
   char *where;
   char *group;
 };
@@ -303,6 +307,20 @@ static const struct col_type_map qi_cols_map[] =
   };
 
 /* This list must be kept in sync with
+ * - the order of the columns in the files_metadata table
+ * - the type and name of the fields in struct media_file_metadata_info
+ */
+static const struct col_type_map mfmi_cols_map[] =
+  {
+    { "file_id",       mfmi_offsetof(file_id),        DB_TYPE_INT,    DB_FIXUP_STANDARD },
+    { "songalbumid",   mfmi_offsetof(songalbumid),    DB_TYPE_INT64 },
+    { "songartistid",  mfmi_offsetof(songartistid),   DB_TYPE_INT64 },
+    { "metadata_kind", mfmi_offsetof(metadata_kind),  DB_TYPE_INT },
+    { "idx",           mfmi_offsetof(idx),            DB_TYPE_INT },
+    { "value",         mfmi_offsetof(value),          DB_TYPE_STRING },
+  };
+
+/* This list must be kept in sync with
  * - the order of the columns in the files table
  * - the name of the fields in struct db_media_file_info
  */
@@ -428,6 +446,21 @@ static const ssize_t dbgri_cols_map[] =
     dbgri_offsetof(seek),
   };
 
+
+/* This list must be kept in sync with
+ * - the order of the columns in the files_metadata table
+ * - the name of the fields in struct db_media_file_metadata_info
+ */
+static const ssize_t dbmfmi_cols_map[] =
+  {
+    dbmfmi_offsetof(file_id),
+    dbmfmi_offsetof(songalbumid),
+    dbmfmi_offsetof(songartistid),
+    dbmfmi_offsetof(metadata_kind),
+    dbmfmi_offsetof(idx),
+    dbmfmi_offsetof(value),
+  };
+
 /* This list must be kept in sync with
  * - the order of fields in the Q_BROWSE_INFO query
  * - the name of the fields in struct db_browse_info
@@ -515,6 +548,7 @@ static const char *sort_clause[] =
     "pos",
     "shuffle_pos",
     "f.date_released DESC, f.title_sort DESC",
+    "m.value",
   };
 
 /* Browse clauses, used for SELECT, WHERE, GROUP BY and for default ORDER BY
@@ -523,16 +557,18 @@ static const char *sort_clause[] =
  */
 static const struct browse_clause browse_clause[] =
   {
-    { "",                                      "",                 "" },
-    { "f.album_artist, f.album_artist_sort",   "f.album_artist",   "f.album_artist_sort, f.album_artist" },
-    { "f.album, f.album_sort",                 "f.album",          "f.album_sort, f.album" },
-    { "f.genre, f.genre",                      "f.genre",          "f.genre" },
-    { "f.composer, f.composer_sort",           "f.composer",       "f.composer_sort, f.composer" },
-    { "f.year, f.year",                        "f.year",           "f.year" },
-    { "f.disc, f.disc",                        "f.disc",           "f.disc" },
-    { "f.track, f.track",                      "f.track",          "f.track" },
-    { "f.virtual_path, f.virtual_path",        "f.virtual_path",   "f.virtual_path" },
-    { "f.path, f.path",                        "f.path",           "f.path" },
+    { "",                                      "",   "",                 "" },
+    { "f.album_artist, f.album_artist_sort",   "",   "f.album_artist",   "f.album_artist_sort, f.album_artist" },
+    { "f.album, f.album_sort",                 "",   "f.album",          "f.album_sort, f.album" },
+    { "f.genre, f.genre",                      "",   "f.genre",          "f.genre" },
+    { "f.composer, f.composer_sort",           "",   "f.composer",       "f.composer_sort, f.composer" },
+    { "f.year, f.year",                        "",   "f.year",           "f.year" },
+    { "f.disc, f.disc",                        "",   "f.disc",           "f.disc" },
+    { "f.track, f.track",                      "",   "f.track",          "f.track" },
+    { "f.virtual_path, f.virtual_path",        "",   "f.virtual_path",   "f.virtual_path" },
+    { "f.path, f.path",                        "",   "f.path",           "f.path" },
+    { "m.value, m.value",                      "JOIN files_metadata m ON f.id = m.file_id",   "m.metadata_kind = 1 AND m.value",          "m.value" },
+    { "m.value, m.value",                      "JOIN files_metadata m ON f.id = m.file_id",   "m.metadata_kind = 5 AND m.value",          "m.value" },
   };
 
 
@@ -644,6 +680,28 @@ db_pl_type_label(enum pl_type pl_type)
   if (pl_type < ARRAY_SIZE(pl_type_label))
     {
       return pl_type_label[pl_type];
+    }
+
+  return NULL;
+}
+
+/* Keep in sync with enum metadata_kind */
+static struct metadata_kind_info metadata_infos[] = 
+  {
+    { "lyrics", 0 },
+    { "genre",  1 },
+    { "musicbrainz_albumid", 0 },
+    { "musicbrainz_artistid", 0 },
+    { "musicbrainz_albumartistid", 0 },
+    { "composer",  1 },
+  };
+
+const struct metadata_kind_info *
+db_metadata_kind_info_get(enum metadata_kind metadata_kind)
+{
+  if (metadata_kind < ARRAY_SIZE(metadata_infos))
+    {
+      return &metadata_infos[metadata_kind];
     }
 
   return NULL;
@@ -790,6 +848,36 @@ free_mfi(struct media_file_info *mfi, int content_only)
 }
 
 void
+free_mfmi(struct media_file_metadata_info *mfi_extra_md, int content_only)
+{
+  if (!mfi_extra_md)
+    return;
+
+  free(mfi_extra_md->value);
+
+  if (!content_only)
+    free(mfi_extra_md);
+  else
+    memset(mfi_extra_md, 0, sizeof(struct media_file_metadata_info));
+}
+
+void
+free_mfmi_list(struct media_file_metadata_info **mfmi, int content_only)
+{
+  struct media_file_metadata_info *next;
+
+  if (!mfmi)
+    return;
+
+  while (*mfmi)
+    {
+      next = (*mfmi)->next;
+      free_mfmi(*mfmi, content_only);
+      *mfmi = next;
+    }
+}
+
+void
 free_pli(struct playlist_info *pli, int content_only)
 {
   if (!pli)
@@ -847,6 +935,7 @@ free_query_params(struct query_params *qp, int content_only)
   free(qp->having);
   free(qp->order);
   free(qp->group);
+  free(qp->join);
 
   if (!content_only)
     free(qp);
@@ -1436,6 +1525,12 @@ bind_qi(sqlite3_stmt *stmt, struct db_queue_item *qi)
   return bind_generic(stmt, qi, qi_cols_map, ARRAY_SIZE(qi_cols_map), qi->id);
 }
 
+static int
+bind_mfmi(sqlite3_stmt *stmt, struct media_file_metadata_info *mfmi)
+{
+  return bind_generic(stmt, mfmi, mfmi_cols_map, ARRAY_SIZE(mfmi_cols_map), 0);
+}
+
 /* Unlock notification support */
 static void
 unlock_notify_cb(void **args, int nargs)
@@ -1967,6 +2062,7 @@ db_free_query_clause(struct query_clause *qc)
   if (!qc)
     return;
 
+  sqlite3_free(qc->join);
   sqlite3_free(qc->where);
   sqlite3_free(qc->group);
   sqlite3_free(qc->having);
@@ -2015,6 +2111,11 @@ db_build_query_clause(struct query_params *qp)
     qc->order = sqlite3_mprintf("ORDER BY %s", browse_clause[qp->type & ~Q_F_BROWSE].group);
   else
     qc->order = sqlite3_mprintf("");
+
+  if (qp->join)
+    qc->join = sqlite3_mprintf("%s", qp->join);
+  else
+    qc->join = sqlite3_mprintf("");
 
   switch (qp->idx_type)
     {
@@ -2239,20 +2340,32 @@ db_build_query_plitems(struct query_params *qp, struct query_clause *qc)
 }
 
 static char *
+db_build_query_file_metadata(struct query_params *qp, struct query_clause *qc)
+{
+  char *count;
+  char *query;
+
+  count = sqlite3_mprintf("SELECT COUNT(*) FROM files_metadata fm JOIN files f ON fm.file_id = f.id %s AND fm.file_id = %d;", qc->where, qp->id);
+  query = sqlite3_mprintf("SELECT fm.* FROM files_metadata fm JOIN files f ON fm.file_id = f.id %s AND fm.file_id = %d ORDER BY fm.metadata_kind ASC, fm.idx ASC %s;", qc->where, qp->id, qc->index);
+
+  return db_build_query_check(qp, count, query);
+}
+
+static char *
 db_build_query_group_albums(struct query_params *qp, struct query_clause *qc)
 {
   char *count;
   char *query;
 
-  count = sqlite3_mprintf("SELECT COUNT(DISTINCT f.songalbumid) FROM files f %s;", qc->where);
+  count = sqlite3_mprintf("SELECT COUNT(DISTINCT f.songalbumid) FROM files f %s %s;", qc->join, qc->where);
   query = sqlite3_mprintf("SELECT" \
 			  " g.id, g.persistentid, f.album, f.album_sort, COUNT(f.id) AS track_count," \
 			  " 1 AS album_count, f.album_artist, f.songartistid," \
 			  " SUM(f.song_length) AS song_length, MIN(f.data_kind) AS data_kind, MIN(f.media_kind) AS media_kind," \
 			  " MAX(f.year) AS year, MAX(f.date_released) AS date_released," \
 			  " MAX(f.time_added) AS time_added, MAX(f.time_played) AS time_played, MAX(f.seek) AS seek " \
-			  "FROM files f JOIN groups g ON f.songalbumid = g.persistentid %s " \
-			  "GROUP BY f.songalbumid %s %s %s;", qc->where, qc->having, qc->order, qc->index);
+			  "FROM files f JOIN groups g ON f.songalbumid = g.persistentid %s %s " \
+			  "GROUP BY f.songalbumid %s %s %s;", qc->join, qc->where, qc->having, qc->order, qc->index);
 
   return db_build_query_check(qp, count, query);
 }
@@ -2343,20 +2456,22 @@ static char *
 db_build_query_browse(struct query_params *qp, struct query_clause *qc)
 {
   const char *where;
+  const char *from;
   const char *select;
   char *count;
   char *query;
 
   select = browse_clause[qp->type & ~Q_F_BROWSE].select;
+  from  = browse_clause[qp->type & ~Q_F_BROWSE].from;
   where  = browse_clause[qp->type & ~Q_F_BROWSE].where;
 
-  count = sqlite3_mprintf("SELECT COUNT(*) FROM (SELECT %s FROM files f %s AND %s != '' %s);", select, qc->where, where, qc->group);
+  count = sqlite3_mprintf("SELECT COUNT(*) FROM (SELECT %s FROM files f %s %s AND %s != '' %s);", select, from, qc->where, where, qc->group);
   query = sqlite3_mprintf("SELECT %s, COUNT(f.id) AS track_count, COUNT(DISTINCT f.songalbumid) AS album_count, COUNT(DISTINCT f.songartistid) AS artist_count,"
 			  " SUM(f.song_length) AS song_length, MIN(f.data_kind) AS data_kind, MIN(f.media_kind) AS media_kind,"
 			  " MAX(f.year) AS year, MAX(f.date_released) AS date_released,"
 			  " MAX(f.time_added) AS time_added, MAX(f.time_played) AS time_played, MAX(f.seek) AS seek "
-			  "FROM files f %s AND %s != '' %s %s %s;",
-			  select, qc->where, where, qc->group, qc->order, qc->index);
+			  "FROM files f %s %s AND %s != '' %s %s %s;",
+			  select, from, qc->where, where, qc->group, qc->order, qc->index);
 
   return db_build_query_check(qp, count, query);
 }
@@ -2406,6 +2521,10 @@ db_query_start(struct query_params *qp)
 
       case Q_PLITEMS:
 	query = db_build_query_plitems(qp, qc);
+	break;
+
+      case Q_FILE_METADATA:
+	query = db_build_query_file_metadata(qp, qc);
 	break;
 
       case Q_GROUP_ALBUMS:
@@ -2577,6 +2696,26 @@ db_query_fetch_file(struct db_media_file_info *dbmfi, struct query_params *qp)
   ret = db_query_fetch(dbmfi, qp, dbmfi_cols_map, ARRAY_SIZE(dbmfi_cols_map));
   if (ret < 0) {
       DPRINTF(E_LOG, L_DB, "Failed to fetch db_media_file_info\n");
+  }
+  return ret;
+}
+
+int
+db_query_fetch_file_metadata(struct db_media_file_metadata_info *dbmfmi, struct query_params *qp)
+{
+  int ret;
+
+  memset(dbmfmi, 0, sizeof(struct db_media_file_metadata_info));
+
+  if (qp->type != Q_FILE_METADATA)
+    {
+      DPRINTF(E_LOG, L_DB, "Not a file metadata query!\n");
+      return -1;
+    }
+
+  ret = db_query_fetch(dbmfmi, qp, dbmfmi_cols_map, ARRAY_SIZE(dbmfmi_cols_map));
+  if (ret < 0) {
+      DPRINTF(E_LOG, L_DB, "Failed to fetch db_media_file_metadata_info\n");
   }
   return ret;
 }
@@ -3600,6 +3739,71 @@ db_file_update_directoryid(const char *path, int dir_id)
   return ((ret < 0) ? -1 : sqlite3_changes(hdl));
 #undef Q_TMPL
 }
+
+/* Files metadata */
+
+int
+db_file_metadata_add(int file_id, int64_t songalbumid, int64_t songartistid, struct media_file_metadata_info *mfmi)
+{
+  int ret = 0;
+
+  if (file_id == 0)
+    {
+      DPRINTF(E_WARN, L_DB, "Trying to add file_metadata with zero file_id\n");
+      return -1;
+    }
+
+  mfmi->file_id = file_id;
+  mfmi->songalbumid = songalbumid;
+  mfmi->songartistid = songartistid;
+
+  ret = bind_mfmi(db_statements.files_metadata_insert, mfmi);
+  if (ret < 0)
+    return -1;
+
+  ret = db_statement_run(db_statements.files_metadata_insert, 0);
+  if (ret < 0)
+    return -1;
+
+  return 0;
+}
+
+int
+db_file_metadata_add_all(int file_id, int64_t songalbumid, int64_t songartistid, struct media_file_metadata_info *mfmi)
+{
+  struct media_file_metadata_info *tmp;
+  int ret = 0;
+
+  tmp = mfmi;
+  while (tmp && ret >= 0)
+    {
+      ret = db_file_metadata_add(file_id, songalbumid, songartistid, tmp);
+      if (ret < 0)
+        {
+          return -1;
+        }
+      tmp = tmp->next;
+    }
+
+  library_update_trigger(LISTENER_DATABASE);
+
+  return 0;
+}
+
+void
+db_file_metadata_clear(int file_id)
+{
+#define Q_TMPL "DELETE FROM files_metadata WHERE file_id = %d;"
+  char *query;
+
+  query = sqlite3_mprintf(Q_TMPL, file_id);
+  db_query_run(query, 1, LISTENER_DATABASE);
+
+#undef Q_TMPL
+}
+
+/* File Metadata */
+
 
 
 /* Playlists */
@@ -7136,9 +7340,12 @@ db_statements_prepare(void)
   db_statements.queue_items_insert = db_statements_prepare_insert(qi_cols_map, ARRAY_SIZE(qi_cols_map), "queue");
   db_statements.queue_items_update = db_statements_prepare_update(qi_cols_map, ARRAY_SIZE(qi_cols_map), "queue");
 
+  db_statements.files_metadata_insert = db_statements_prepare_insert(mfmi_cols_map, ARRAY_SIZE(mfmi_cols_map), "files_metadata");
+
   if ( !db_statements.files_insert || !db_statements.files_update || !db_statements.files_ping
        || !db_statements.playlists_insert || !db_statements.playlists_update
        || !db_statements.queue_items_insert || !db_statements.queue_items_update
+       || !db_statements.files_metadata_insert
      )
     return -1;
 

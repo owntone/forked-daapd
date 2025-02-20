@@ -449,7 +449,7 @@ rss_save(struct playlist_info *pli, int *count, enum rss_scan_type scan_type)
 
       mfi_metadata_fixup(&mfi, &ri, feed_title, feed_author, time_added);
 
-      library_media_save(&mfi);
+      library_media_save(&mfi, NULL);
 
       free_mfi(&mfi, 1);
     }

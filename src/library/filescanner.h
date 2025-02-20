@@ -8,7 +8,7 @@
 /* --------------------------- Actual scanners ---------------------------- */
 
 int
-scan_metadata_ffmpeg(struct media_file_info *mfi, const char *file);
+scan_metadata_ffmpeg(struct media_file_info *mfi, struct media_file_metadata_info **mfmi, const char *file);
 
 void
 scan_metadata_stream(struct media_file_info *mfi, const char *path);

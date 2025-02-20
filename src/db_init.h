@@ -26,7 +26,7 @@
  * is a major upgrade. In other words minor version upgrades permit downgrading
  * the server after the database was upgraded. */
 #define SCHEMA_VERSION_MAJOR 22
-#define SCHEMA_VERSION_MINOR 2
+#define SCHEMA_VERSION_MINOR 3
 
 int
 db_init_indices(sqlite3 *hdl);

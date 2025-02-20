@@ -125,8 +125,9 @@ static struct library_callback_register library_cb_register[LIBRARY_MAX_CALLBACK
 /* ------------------- CALLED BY LIBRARY SOURCE MODULES -------------------- */
 
 int
-library_media_save(struct media_file_info *mfi)
+library_media_save(struct media_file_info *mfi, struct media_file_metadata_info *mfmi)
 {
+  int file_id;
   int ret;
 
   if (!mfi->path || !mfi->fname || !mfi->scan_kind)
@@ -144,9 +145,24 @@ library_media_save(struct media_file_info *mfi)
     }
 
   if (mfi->id == 0)
-    ret = db_file_add(mfi);
+    {
+      ret = db_file_add(mfi);
+      if (ret == 0 && mfmi)
+      {
+        file_id = db_file_id_bypath(mfi->path);
+        if (file_id > 0)
+          ret = db_file_metadata_add_all(file_id, mfi->songalbumid, mfi->songartistid, mfmi);
+      }
+    }
   else
-    ret = db_file_update(mfi);
+    {
+      ret = db_file_update(mfi);
+      if (ret == 0 && mfmi)
+        {
+          db_file_metadata_clear(mfi->id);
+          ret = db_file_metadata_add_all(mfi->id, mfi->songalbumid, mfi->songartistid, mfmi);
+        }
+    }
 
   return ret;
 }
