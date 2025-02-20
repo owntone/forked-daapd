@@ -368,6 +368,81 @@ rescan(void *arg, int *ret)
 }
 
 static enum command_state
+rescan_path(void *arg, int *ret)
+{
+  time_t starttime;
+  time_t endtime;
+  int i;
+  char *path = (char *)arg;
+  char virtual_path[PATH_MAX];
+  struct stat st;
+  int ret1;
+  char *ptr;
+
+  // drop any trailing '/' on path
+  ptr = path + strlen(path)-1;
+  while (ptr > path)
+    {
+      if (*ptr != '/')
+        break;
+
+      *ptr = '\0';
+      --ptr;
+    }
+
+  listener_notify(LISTENER_UPDATE);
+  starttime = time(NULL);
+
+  DPRINTF(E_LOG, L_LIB, "Library partial rescan triggered: '%s'\n", path);
+  ret1 = lstat(path, &st);
+  if (ret1 < 0 || (ret1 == 0 && (st.st_mode & S_IFMT) != S_IFDIR))
+    {
+      DPRINTF(E_LOG, L_LIB, "Partial rescan on '%s' is not a valid directory\n", path);
+      goto out;
+    }
+
+  // protecting everything else other than the request path
+  db_file_ping_excl_bymatch(path);
+  db_pl_ping_excl_bymatch(path);
+  ret1 = snprintf(virtual_path, sizeof(virtual_path), "/file:%s", path);
+  if ((ret1 < 0) || (ret1 >= sizeof(virtual_path)))
+    DPRINTF(E_LOG, L_SCAN, "Virtual path exceeds PATH_MAX (/file:%s)\n", path);
+  else
+    db_directory_ping_excl_bymatch(virtual_path);
+
+  for (i = 0; sources[i]; i++)
+    {
+      if (!sources[i]->disabled && sources[i]->rescan_path && sources[i]->scan_kind == SCAN_KIND_FILES)
+	{
+	  DPRINTF(E_INFO, L_LIB, "Rescan partial library source '%s'\n", db_scan_kind_label(sources[i]->scan_kind));
+	  sources[i]->rescan_path(path);
+	}
+      else
+	{
+	  DPRINTF(E_INFO, L_LIB, "Library partial source '%s' is disabled\n", db_scan_kind_label(sources[i]->scan_kind));
+	}
+    }
+
+  purge_cruft(starttime, SCAN_KIND_FILES);
+
+  DPRINTF(E_DBG, L_LIB, "Running post library partial scan jobs\n");
+  db_hook_post_scan();
+
+out:
+  endtime = time(NULL);
+  DPRINTF(E_LOG, L_LIB, "Library partial rescan completed in %.f sec (%d changes)\n", difftime(endtime, starttime), deferred_update_notifications);
+  scanning = false;
+
+  if (handle_deferred_update_notifications())
+    listener_notify(LISTENER_UPDATE | LISTENER_DATABASE);
+  else
+    listener_notify(LISTENER_UPDATE);
+
+  *ret = 0;
+  return COMMAND_END;
+}
+
+static enum command_state
 metarescan(void *arg, int *ret)
 {
   enum scan_kind *scan_kind;
@@ -764,6 +839,19 @@ library_rescan(enum scan_kind scan_kind)
   *param = scan_kind;
 
   commands_exec_async(cmdbase, rescan, param);
+}
+
+void
+library_rescan_path(const char *path)
+{
+  if (scanning)
+    {
+      DPRINTF(E_INFO, L_LIB, "Scan already running, ignoring request to trigger a new init path scan\n");
+      return;
+    }
+
+  scanning = true; // TODO Guard "scanning" with a mutex
+  commands_exec_async(cmdbase, rescan_path, (void*)strdup(path));
 }
 
 void

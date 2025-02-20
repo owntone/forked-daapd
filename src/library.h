@@ -104,6 +104,11 @@ struct library_source
   int (*write_metadata)(struct media_file_info *mfi);
 
   /*
+   * Run rescan (called from the library thread)
+   */
+  int (*rescan_path)(const char *path);
+
+  /*
    * Add an item to the library
    */
   int (*item_add)(const char *path);
@@ -186,6 +191,9 @@ library_rescan(enum scan_kind library_source);
 /*
  * Same as library_rescan but also updates unmodified tracks and playlists
  */
+void
+library_rescan_path(const char *path);
+
 void
 library_metarescan(enum scan_kind library_source);
 

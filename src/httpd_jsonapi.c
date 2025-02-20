@@ -1247,10 +1247,16 @@ static int
 jsonapi_reply_update(struct httpd_request *hreq)
 {
   const char *param;
+  const char *param_path;
 
   param = httpd_query_value_find(hreq->query, "scan_kind");
+  param_path = httpd_query_value_find(hreq->query, "path");
 
-  library_rescan(db_scan_kind_enum(param));
+  if (param_path)
+    library_rescan_path(param_path);
+  else
+    library_rescan(db_scan_kind_enum(param));
+
   return HTTP_NOCONTENT;
 }
 

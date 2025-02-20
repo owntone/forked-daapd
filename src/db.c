@@ -3062,6 +3062,18 @@ db_file_ping_bymatch(const char *path, int isdir)
 #undef Q_TMPL_NODIR
 }
 
+void
+db_file_ping_excl_bymatch(const char *path)
+{
+#define Q_TMPL_DIR "UPDATE files SET db_timestamp = %" PRIi64 " WHERE path NOT LIKE '%q/%%';"
+  char *query;
+
+  query = sqlite3_mprintf(Q_TMPL_DIR, (int64_t)time(NULL), path);
+  db_query_run(query, 1, 0);
+
+#undef Q_TMPL_DIR
+}
+
 char *
 db_file_path_byid(int id)
 {
@@ -3643,6 +3655,18 @@ db_pl_ping_bymatch(const char *path, int isdir)
   db_query_run(query, 1, 0);
 #undef Q_TMPL_DIR
 #undef Q_TMPL_NODIR
+}
+
+void
+db_pl_ping_excl_bymatch(const char *path)
+{
+#define Q_TMPL_DIR "UPDATE playlists SET db_timestamp = %" PRIi64 " WHERE path NOT LIKE '%q/%%';"
+  char *query;
+
+  query = sqlite3_mprintf(Q_TMPL_DIR, (int64_t)time(NULL), path);
+  db_query_run(query, 1, 0);
+
+#undef Q_TMPL_DIR
 }
 
 void
@@ -4451,6 +4475,18 @@ void
 db_directory_ping_bymatch(char *virtual_path)
 {
 #define Q_TMPL_DIR "UPDATE directories SET db_timestamp = %" PRIi64 " WHERE virtual_path = '%q' OR virtual_path LIKE '%q/%%';"
+  char *query;
+
+  query = sqlite3_mprintf(Q_TMPL_DIR, (int64_t)time(NULL), virtual_path, virtual_path);
+
+  db_query_run(query, 1, 0);
+#undef Q_TMPL_DIR
+}
+
+void
+db_directory_ping_excl_bymatch(const char *virtual_path)
+{
+#define Q_TMPL_DIR "UPDATE directories SET db_timestamp = %" PRIi64 " WHERE virtual_path <> '%q' OR virtual_path NOT LIKE '%q/%%';"
   char *query;
 
   query = sqlite3_mprintf(Q_TMPL_DIR, (int64_t)time(NULL), virtual_path, virtual_path);
@@ -6544,8 +6580,8 @@ db_watch_cookie_known(uint32_t cookie)
 int
 db_watch_enum_start(struct watch_enum *we)
 {
-#define Q_MATCH_TMPL "SELECT wd FROM inotify WHERE path LIKE '%q/%%';"
-#define Q_COOKIE_TMPL "SELECT wd FROM inotify WHERE cookie = %" PRIi64 ";"
+#define Q_MATCH_TMPL "SELECT wd,path FROM inotify WHERE path LIKE '%q/%%';"
+#define Q_COOKIE_TMPL "SELECT wd,path FROM inotify WHERE cookie = %" PRIi64 ";"
   sqlite3_stmt *stmt;
   char *query;
   int ret;
@@ -6629,6 +6665,40 @@ db_watch_enum_fetchwd(struct watch_enum *we, uint32_t *wd)
 
   return 0;
 }
+
+int
+db_watch_enum_fetch(struct watch_enum *we, struct watch_info *wi)
+{
+  int ret;
+
+  wi->wd = 0;
+  wi->cookie = 0;
+
+  if (!we->stmt)
+    {
+      DPRINTF(E_LOG, L_DB, "Watch enum not started!\n");
+      return -1;
+    }
+
+  ret = db_blocking_step(we->stmt);
+  if (ret == SQLITE_DONE)
+    {
+      DPRINTF(E_INFO, L_DB, "End of watch enum results\n");
+      return 0;
+    }
+  else if (ret != SQLITE_ROW)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      return -1;
+    }
+
+  wi->wd = (uint32_t)sqlite3_column_int(we->stmt, 0);
+  if (wi->path)
+    snprintf(wi->path, PATH_MAX, (char*)sqlite3_column_text(we->stmt, 1));
+
+  return 0;
+}
+
 
 
 #ifdef DB_PROFILE
