@@ -1,0 +1,86 @@
+/*
+ * MkDocs Material theme buttons have wrong colors for the theme
+ * setting:
+ *
+ *    palette:
+ *        scheme: default
+ *        primary: white
+ *
+ * Thus the following CSS overwrites the button background- and
+ * text-colors.
+ */
+.md-button {
+  color: var(--md-accent-fg-color) !important;
+  border-color: currentColor !important;
+}
+.md-button:focus,
+.md-button:hover {
+  color: var(--md-primary-fg-color) !important;
+  background-color: var(--md-accent-fg-color) !important;
+  border-color: var(--md-accent-fg-color) !important;
+}
+
+/*
+ * The nav title has a click handler to scroll to the top
+ */
+.md-header-nav__title {
+  cursor: pointer;
+}
+
+/*
+ * Text alignment
+ */
+.text-center {
+  text-align: center;
+}
+
+/*
+ * Custom CSS for images
+ */
+.hidden {
+  visibility: hidden;
+  opacity: 0;
+  transition: visibility 0s linear 300ms, opacity 300ms;
+}
+.visible {
+  visibility: visible;
+  opacity: 1;
+  transition: visibility 0s linear 0s, opacity 300ms;
+}
+.fullscreen-image-background {
+  z-index: 25;
+  background-color: rgba(10, 10, 10, 0.5);
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  top: 0;
+}
+.fullscreen-image-background img {
+  transition: opacity 1s;
+  cursor: zoom-out;
+  box-shadow: 0 4px 8px 0 rgba(0, 0, 0, 0.2), 0 6px 20px 0 rgba(0, 0, 0, 0.19);
+  z-index: 100;
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  margin: 1rem auto;
+  max-height: calc(100vh - 2rem);
+  width: auto;
+}
+.zoom {
+  box-shadow: 0 4px 8px 0 rgba(0, 0, 0, 0.2), 0 6px 20px 0 rgba(0, 0, 0, 0.19);
+  border-radius: 0.2rem;
+  margin: 0.5rem;
+  width: 25%;
+  cursor: zoom-in;
+}
+.zoom-wrapper {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
