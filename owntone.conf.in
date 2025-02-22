@@ -21,10 +21,11 @@ general {
 	# to initiate backup of songs3.db
 #	db_backup_path = "@localstatedir@/cache/@PACKAGE@/songs3.bak"
 
-	# Log file and level
+	# Log file, level and format
 	# Available levels: fatal, log, warning, info, debug, spam
 	logfile = "@localstatedir@/log/@PACKAGE@.log"
 	loglevel = log
+	logformat = default
 
 	# Admin password for the web interface
 	# Note that access to the web interface from computers in

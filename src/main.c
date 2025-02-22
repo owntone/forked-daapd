@@ -495,6 +495,7 @@ main(int argc, char **argv)
   int loglevel = -1;
   char *logdomains = NULL;
   char *logfile = NULL;
+  char *logformat = NULL;
   char *ffid = NULL;
   char *pidfile = PIDFILE;
   char *webroot = WEB_ROOT;
@@ -510,26 +511,26 @@ main(int argc, char **argv)
   int i;
   int ret;
 
-  struct option option_map[] =
-    {
-      { "ffid",         1, NULL, 'b' },
-      { "debug",        1, NULL, 'd' },
-      { "logdomains",   1, NULL, 'D' },
-      { "foreground",   0, NULL, 'f' },
-      { "config",       1, NULL, 'c' },
-      { "pidfile",      1, NULL, 'P' },
-      { "version",      0, NULL, 'v' },
-      { "webroot",      1, NULL, 'w' },
-      { "sqliteext",    1, NULL, 's' },
-      { "testrun",      0, NULL, 't' }, // Used for CI, not documented to user
+  struct option option_map[] = {
+    { "ffid",          1, NULL, 'b' },
+    { "debug",         1, NULL, 'd' },
+    { "logdomains",    1, NULL, 'D' },
+    { "foreground",    0, NULL, 'f' },
+    { "config",        1, NULL, 'c' },
+    { "pidfile",       1, NULL, 'P' },
+    { "version",       0, NULL, 'v' },
+    { "webroot",       1, NULL, 'w' },
+    { "sqliteext",     1, NULL, 's' },
+    { "testrun",       0, NULL, 't' }, // Used for CI, not documented to user
 
-      { "mdns-no-rsp",  0, NULL, 512 },
-      { "mdns-no-daap", 0, NULL, 513 },
-      { "mdns-no-cname",0, NULL, 514 },
-      { "mdns-no-web",  0, NULL, 515 },
+    { "mdns-no-rsp",   0, NULL, 512 },
+    { "mdns-no-daap",  0, NULL, 513 },
+    { "mdns-no-cname", 0, NULL, 514 },
+    { "mdns-no-web",   0, NULL, 515 },
+    { "logformat",     1, NULL, 516 },
 
-      { NULL,           0, NULL, 0 }
-    };
+    { NULL,            0, NULL, 0   }
+  };
 
   while ((option = getopt_long(argc, argv, "D:d:c:P:ftb:vw:s:", option_map, NULL)) != -1)
     {
@@ -549,6 +550,10 @@ main(int argc, char **argv)
 
 	  case 515:
 	    mdns_no_web = true;
+	    break;
+
+	  case 516:
+	    logformat = optarg;
 	    break;
 
 	  case 't':
@@ -603,7 +608,7 @@ main(int argc, char **argv)
 	}
     }
 
-  ret = logger_init(NULL, NULL, (loglevel < 0) ? E_LOG : loglevel);
+  ret = logger_init(NULL, NULL, (loglevel < 0) ? E_LOG : loglevel, NULL);
   if (ret != 0)
     {
       fprintf(stderr, "Could not initialize log facility\n");
@@ -625,10 +630,11 @@ main(int argc, char **argv)
   /* Reinit log facility with configfile values */
   if (loglevel < 0)
     loglevel = cfg_getint(cfg_getsec(cfg, "general"), "loglevel");
-
+  if (!logformat)
+    logformat = cfg_getstr(cfg_getsec(cfg, "general"), "logformat");
   logfile = cfg_getstr(cfg_getsec(cfg, "general"), "logfile");
 
-  ret = logger_init(logfile, logdomains, loglevel);
+  ret = logger_init(logfile, logdomains, loglevel, logformat);
   if (ret != 0)
     {
       fprintf(stderr, "Could not reinitialize log facility with config file settings\n");

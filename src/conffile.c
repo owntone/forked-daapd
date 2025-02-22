@@ -49,6 +49,7 @@ static cfg_opt_t sec_general[] =
     CFG_STR("db_backup_path", NULL, CFGF_NONE),
     CFG_STR("logfile", STATEDIR "/log/" PACKAGE ".log", CFGF_NONE),
     CFG_INT_CB("loglevel", E_LOG, CFGF_NONE, &cb_loglevel),
+    CFG_STR("logformat", "default", CFGF_NONE),
     CFG_STR("admin_password", NULL, CFGF_NONE),
     CFG_INT("websocket_port", 3688, CFGF_NONE),
     CFG_STR("websocket_interface", NULL, CFGF_NONE),

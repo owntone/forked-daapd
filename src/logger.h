@@ -84,7 +84,7 @@ void
 logger_detach(void);
 
 int
-logger_init(char *file, char *domains, int severity);
+logger_init(char *file, char *domains, int severity, char *logformat);
 
 void
 logger_deinit(void);
