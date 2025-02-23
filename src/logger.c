@@ -60,7 +60,13 @@ static char *logfilename;
 static FILE *logfile;
 static char *labels[] = { "config", "daap", "db", "httpd", "http", "main", "mdns", "misc", "rsp", "scan", "xcode", "event", "remote", "dacp", "ffmpeg", "artwork", "player", "raop", "laudio", "dmap", "dbperf", "spotify", "scrobble", "cache", "mpd", "stream", "cast", "fifo", "lib", "web", "airplay", "rcp" };
 static char *severities[] = { "FATAL", "LOG", "WARN", "INFO", "DEBUG", "SPAM" };
+static char *format_labels[] = { "default", "logfmt" };
 
+enum format {
+  L_FMT_DEFAULT = 0,
+  L_FMT_LOGFMT = 1,
+};
+static enum format format = L_FMT_DEFAULT;
 
 static int
 set_logdomains(char *domains)
@@ -89,6 +95,23 @@ set_logdomains(char *domains)
 	  fprintf(stderr, "Error: unknown log domain '%s'\n", d);
 	  return -1;
 	}
+    }
+
+  return 0;
+}
+
+static int
+format_code_get(const char *label)
+{
+  int i;
+
+  if (!label)
+    return 0;
+
+  for (i = 0; i < ARRAY_SIZE(format_labels); i++)
+    {
+      if (strcmp(label, format_labels[i]) == 0)
+	return i;
     }
 
   return 0;
@@ -139,16 +162,34 @@ logger_write_with_label(int severity, int domain, const char *content)
   char thread_nametid[32];
   time_t t;
   struct tm timebuf;
+  char logfmt_msg[1024];
   int ret;
 
   thread_getnametid(thread_nametid, sizeof(thread_nametid));
-
   t = time(NULL);
-  ret = strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", localtime_r(&t, &timebuf));
-  if (ret == 0)
-    stamp[0] = '\0';
 
-  logger_write("[%s] [%5s] [%16s] %8s: %s", stamp, severities[severity], thread_nametid, labels[domain], content);
+  if (format == L_FMT_LOGFMT)
+    {
+      ret = strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S%z", localtime_r(&t, &timebuf));
+      if (ret == 0)
+	stamp[0] = '\0';
+
+      strncpy(logfmt_msg, content, sizeof(logfmt_msg));
+      logfmt_msg[sizeof(logfmt_msg) - 1] = '\0';
+      safe_snreplace(logfmt_msg, sizeof(logfmt_msg), "\n", " ");
+      safe_snreplace(logfmt_msg, sizeof(logfmt_msg), "\"", "\\\"");
+
+      logger_write("time=%s level=%s thread=\"%s\" component=%s msg=\"%s\"\n", stamp, severities[severity], thread_nametid,
+          labels[domain], logfmt_msg);
+    }
+  else
+    {
+      ret = strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", localtime_r(&t, &timebuf));
+      if (ret == 0)
+	stamp[0] = '\0';
+
+      logger_write("[%s] [%5s] [%16s] %8s: %s", stamp, severities[severity], thread_nametid, labels[domain], content);
+    }
 }
 
 static void
@@ -408,7 +449,7 @@ logger_detach(void)
 }
 
 int
-logger_init(char *file, char *domains, int severity)
+logger_init(char *file, char *domains, int severity, char *logformat)
 {
   int ret;
 
@@ -421,6 +462,7 @@ logger_init(char *file, char *domains, int severity)
 
   console = 1;
   threshold = severity;
+  format = format_code_get(logformat);
 
   if (domains)
     {
