@@ -124,6 +124,40 @@ curl_request_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
   return realsize;
 }
 
+static int
+curl_debug_cb(CURL *handle, curl_infotype type, char *data, size_t size, void *ctx)
+{
+  switch (type)
+    {
+    case CURLINFO_TEXT:
+      DPRINTF(E_DBG, L_HTTP, "curl - %.*s", (int) size, data);
+      break;
+    case CURLINFO_HEADER_OUT:
+      DPRINTF(E_DBG, L_HTTP, "curl > Request-Header - %.*s", (int) size, data);
+      break;
+    case CURLINFO_DATA_OUT:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl > Request-Body\n");
+      break;
+    case CURLINFO_SSL_DATA_OUT:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl > SSL Out\n");
+      break;
+    case CURLINFO_HEADER_IN:
+      DPRINTF(E_DBG, L_HTTP, "curl < Response-Header - %.*s", (int) size, data);
+      break;
+    case CURLINFO_DATA_IN:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl < Response-Body\n");
+      break;
+    case CURLINFO_SSL_DATA_IN:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl < SSL In\n");
+      break;
+    default:
+      // Ignore unknown types
+      break;
+    }
+
+  return 0;
+}
+
 int
 http_client_request(struct http_client_ctx *ctx, struct http_client_session *client_session)
 {
@@ -179,6 +213,12 @@ http_client_request(struct http_client_ctx *ctx, struct http_client_session *cli
   // Artwork and playlist requests might require redirects
   curl_easy_setopt(session->curl, CURLOPT_FOLLOWLOCATION, 1);
   curl_easy_setopt(session->curl, CURLOPT_MAXREDIRS, 5);
+
+  if (logger_severity() >= E_DBG)
+    {
+      curl_easy_setopt(session->curl, CURLOPT_DEBUGFUNCTION, curl_debug_cb);
+      curl_easy_setopt(session->curl, CURLOPT_VERBOSE, 1);
+    }
 
   // Make request
   DPRINTF(E_INFO, L_HTTP, "Making request for %s\n", ctx->url);
