@@ -39,11 +39,12 @@
 #include <event2/keyvalq_struct.h>
 
 #include <curl/curl.h>
+#include <pthread.h>
 
+#include "conffile.h"
 #include "http.h"
 #include "logger.h"
 #include "misc.h"
-#include "conffile.h"
 
 /* Formats we can read so far */
 #define PLAYLIST_UNK 0
@@ -55,17 +56,33 @@
 // Number of seconds the client will wait for a response before aborting
 #define HTTP_CLIENT_TIMEOUT 8
 
+struct http_client_session {
+  CURL *curl;
+  const char *user_agent;
+  long verifypeer;
+  long timeout_sec;
+  pthread_mutex_t mutex;
+};
 
-void
-http_client_session_init(struct http_client_session *session)
+struct http_client_session *
+http_client_session_new(void)
 {
-  session->curl = curl_easy_init();
+  struct http_client_session *session;
+  CHECK_NULL(L_HTTP, session = calloc(1, sizeof(struct http_client_session)));
+  CHECK_NULL(L_HTTP, session->curl = curl_easy_init());
+  session->user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
+  session->verifypeer = cfg_getbool(cfg_getsec(cfg, "general"), "ssl_verifypeer");
+  session->timeout_sec = HTTP_CLIENT_TIMEOUT;
+  pthread_mutex_init(&session->mutex, NULL);
+  return session;
 }
 
 void
-http_client_session_deinit(struct http_client_session *session)
+http_client_session_free(struct http_client_session *session)
 {
   curl_easy_cleanup(session->curl);
+  pthread_mutex_destroy(&session->mutex);
+  free(session);
 }
 
 static void
@@ -107,91 +124,129 @@ curl_request_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
   return realsize;
 }
 
-int
-http_client_request(struct http_client_ctx *ctx, struct http_client_session *session)
+static int
+curl_debug_cb(CURL *handle, curl_infotype type, char *data, size_t size, void *ctx)
 {
-  CURL *curl;
+  switch (type)
+    {
+    case CURLINFO_TEXT:
+      DPRINTF(E_DBG, L_HTTP, "curl - %.*s", (int) size, data);
+      break;
+    case CURLINFO_HEADER_OUT:
+      DPRINTF(E_DBG, L_HTTP, "curl > Request-Header - %.*s", (int) size, data);
+      break;
+    case CURLINFO_DATA_OUT:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl > Request-Body\n");
+      break;
+    case CURLINFO_SSL_DATA_OUT:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl > SSL Out\n");
+      break;
+    case CURLINFO_HEADER_IN:
+      DPRINTF(E_DBG, L_HTTP, "curl < Response-Header - %.*s", (int) size, data);
+      break;
+    case CURLINFO_DATA_IN:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl < Response-Body\n");
+      break;
+    case CURLINFO_SSL_DATA_IN:
+      DHEXDUMP(E_SPAM, L_HTTP, (unsigned char *) data, (int) size, "curl < SSL In\n");
+      break;
+    default:
+      // Ignore unknown types
+      break;
+    }
+
+  return 0;
+}
+
+int
+http_client_request(struct http_client_ctx *ctx, struct http_client_session *client_session)
+{
+  struct http_client_session *session;
   CURLcode res;
-  struct curl_slist *headers;
+  struct curl_slist *headers = NULL;
   struct onekeyval *okv;
-  const char *user_agent;
-  long verifypeer;
   char header[1024];
   long response_code;
+  int ret;
 
-  if (session)
+  if (!client_session)
     {
-      curl = session->curl;
-      curl_easy_reset(curl);
+      session = http_client_session_new();
     }
   else
     {
-      curl = curl_easy_init();
-    }
-  if (!curl)
-    {
-      DPRINTF(E_LOG, L_HTTP, "Error: Could not get curl handle\n");
-      return -1;
+      session = client_session;
+
+      CHECK_ERR(L_HTTP, pthread_mutex_lock(&session->mutex));
+      curl_easy_reset(session->curl);
     }
 
-  user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent);
-  curl_easy_setopt(curl, CURLOPT_URL, ctx->url);
+  curl_easy_setopt(session->curl, CURLOPT_USERAGENT, session->user_agent);
+  curl_easy_setopt(session->curl, CURLOPT_URL, ctx->url);
+  curl_easy_setopt(session->curl, CURLOPT_SSL_VERIFYPEER, session->verifypeer);
 
-  verifypeer = cfg_getbool(cfg_getsec(cfg, "general"), "ssl_verifypeer");
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, verifypeer);
-
-  headers = NULL;
   if (ctx->output_headers)
     {
       for (okv = ctx->output_headers->head; okv; okv = okv->next)
 	{
-	  snprintf(header, sizeof(header), "%s: %s", okv->name, okv->value);
+	  ret = snprintf(header, sizeof(header), "%s: %s", okv->name, okv->value);
+	  if (ret < 0 || ret >= sizeof(header))
+	    {
+	      DPRINTF(E_LOG, L_HTTP, "Could not add header, value has more than %zd chars: '%s: %s'\n", sizeof(header),
+	          okv->name, okv->value);
+	      res = CURLE_FAILED_INIT;
+	      goto out;
+	    }
 	  headers = curl_slist_append(headers, header);
         }
 
-      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+      curl_easy_setopt(session->curl, CURLOPT_HTTPHEADER, headers);
     }
 
-  if (ctx->headers_only)
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L); // Makes curl make a HEAD request
-  else if (ctx->output_body)
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, ctx->output_body); // POST request
+  if (ctx->output_body)
+    curl_easy_setopt(session->curl, CURLOPT_POSTFIELDS, ctx->output_body); // POST request
 
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, HTTP_CLIENT_TIMEOUT);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_request_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, ctx);
+  curl_easy_setopt(session->curl, CURLOPT_TIMEOUT, session->timeout_sec);
+  curl_easy_setopt(session->curl, CURLOPT_WRITEFUNCTION, curl_request_cb);
+  curl_easy_setopt(session->curl, CURLOPT_WRITEDATA, ctx);
 
   // Artwork and playlist requests might require redirects
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-  curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5);
+  curl_easy_setopt(session->curl, CURLOPT_FOLLOWLOCATION, 1);
+  curl_easy_setopt(session->curl, CURLOPT_MAXREDIRS, 5);
 
-  /* Make request */
+  if (logger_severity() >= E_DBG)
+    {
+      curl_easy_setopt(session->curl, CURLOPT_DEBUGFUNCTION, curl_debug_cb);
+      curl_easy_setopt(session->curl, CURLOPT_VERBOSE, 1);
+    }
+
+  // Make request
   DPRINTF(E_INFO, L_HTTP, "Making request for %s\n", ctx->url);
 
-  res = curl_easy_perform(curl);
+  res = curl_easy_perform(session->curl);
+
   if (res != CURLE_OK)
     {
       DPRINTF(E_WARN, L_HTTP, "Request to %s failed: %s\n", ctx->url, curl_easy_strerror(res));
-      curl_slist_free_all(headers);
-      if (!session)
-	{
-	  curl_easy_cleanup(curl);
-	}
-      return -1;
+      goto out;
     }
 
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+  curl_easy_getinfo(session->curl, CURLINFO_RESPONSE_CODE, &response_code);
   ctx->response_code = (int) response_code;
-  curl_headers_save(ctx->input_headers, curl);
+  curl_headers_save(ctx->input_headers, session->curl);
 
-  curl_slist_free_all(headers);
-  if (!session)
+out:
+  if (client_session)
     {
-      curl_easy_cleanup(curl);
+      CHECK_ERR(L_HTTP, pthread_mutex_unlock(&session->mutex));
     }
+  else
+    {
+      http_client_session_free(session);
+    }
+  curl_slist_free_all(headers);
 
-  return 0;
+  return res == CURLE_OK ? 0 : -1;
 }
 
 int

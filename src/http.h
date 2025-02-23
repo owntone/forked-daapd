@@ -4,15 +4,11 @@
 
 #include <event2/buffer.h>
 #include <event2/http.h>
-#include <curl/curl.h>
 #include "misc.h"
 
 #include <libavformat/avformat.h>
 
-struct http_client_session
-{
-  CURL *curl;
-};
+struct http_client_session;
 
 struct http_client_ctx
 {
@@ -28,12 +24,6 @@ struct http_client_ctx
    */
   struct keyval *input_headers;
   struct evbuffer *input_body;
-
-  /* Cut the connection after the headers have been received
-   * Used for getting Shoutcast/ICY headers for old versions of libav/ffmpeg
-   * (requires libevent 1 or 2.1.4+)
-   */
-  int headers_only;
 
   /* HTTP Response code */
   int response_code;
@@ -56,11 +46,11 @@ struct http_icy_metadata
   uint32_t hash;
 };
 
-void
-http_client_session_init(struct http_client_session *session);
+struct http_client_session *
+http_client_session_new(void);
 
 void
-http_client_session_deinit(struct http_client_session *session);
+http_client_session_free(struct http_client_session *session);
 
 /* Make a http(s) request. We use libcurl to make https requests. We could use
  * libevent and avoid the dependency, but for SSL, libevent needs to be v2.1

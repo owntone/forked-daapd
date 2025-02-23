@@ -130,14 +130,7 @@ struct spotify_credentials
   time_t token_time_requested;
 };
 
-struct spotify_http_session
-{
-  pthread_mutex_t lock;
-  struct http_client_session session;
-};
-
-static struct spotify_http_session spotify_http_session = { .lock = PTHREAD_MUTEX_INITIALIZER };
-
+struct http_client_session *session;
 static struct spotify_credentials spotify_credentials;
 static pthread_mutex_t spotify_credentials_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -419,7 +412,7 @@ request_access_tokens(struct keyval *kv, const char **err)
   ctx.output_body = param;
   ctx.input_body = evbuffer_new();
 
-  ret = http_client_request(&ctx, NULL);
+  ret = http_client_request(&ctx, session);
   if (ret < 0)
     {
       *err = "Did not get a reply from Spotify";
@@ -508,9 +501,7 @@ request_endpoint(const char *uri)
 
   DPRINTF(E_DBG, L_SPOTIFY, "Making request to '%s'\n", uri);
 
-  CHECK_ERR(L_SPOTIFY, pthread_mutex_lock(&spotify_http_session.lock));
-  ret = http_client_request(ctx, &spotify_http_session.session);
-  CHECK_ERR(L_SPOTIFY, pthread_mutex_unlock(&spotify_http_session.lock));
+  ret = http_client_request(ctx, session);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_SPOTIFY, "Request for '%s' failed\n", uri);
@@ -2071,9 +2062,7 @@ spotifywebapi_library_init()
   if (ret < 0)
     return -1;
 
-  CHECK_ERR(L_SPOTIFY, pthread_mutex_lock(&spotify_http_session.lock));
-  http_client_session_init(&spotify_http_session.session);
-  CHECK_ERR(L_SPOTIFY, pthread_mutex_unlock(&spotify_http_session.lock));
+  session = http_client_session_new();
   return 0;
 }
 
@@ -2082,9 +2071,7 @@ spotifywebapi_library_deinit()
 {
   spotify_deinit();
 
-  CHECK_ERR(L_SPOTIFY, pthread_mutex_lock(&spotify_http_session.lock));
-  http_client_session_deinit(&spotify_http_session.session);
-  CHECK_ERR(L_SPOTIFY, pthread_mutex_unlock(&spotify_http_session.lock));
+  http_client_session_free(session);
 
   credentials_clear();
 }
